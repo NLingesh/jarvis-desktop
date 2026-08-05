@@ -75,7 +75,7 @@
   "afterPack": "./scripts/fix-fuse-after-pack.js",
   "publish": {
     "provider": "github",
-    "owner": "jarvis-ai",
+    "owner": "NLingesh",
     "repo": "jarvis-desktop"
   }
 }
