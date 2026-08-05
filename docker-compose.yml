@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./jarvis_backend
+      dockerfile: Dockerfile
+    container_name: jarvis-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+      - DEBUG=False
+    volumes:
+      - jarvis-data:/root/.jarvis
+      - ./jarvis_backend:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - jarvis-network
+
+  frontend:
+    build:
+      context: ./jarvis_frontend
+      dockerfile: Dockerfile
+    container_name: jarvis-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    volumes:
+      - ./jarvis_frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - jarvis-network
+
+volumes:
+  jarvis-data:
+
+networks:
+  jarvis-network:
+    driver: bridge

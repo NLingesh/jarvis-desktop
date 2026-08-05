@@ -1,0 +1,81 @@
+{
+  "appId": "com.jarvis.desktop",
+  "productName": "JARVIS",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "electron/main.js",
+    "electron/preload.js",
+    "package.json"
+  ],
+  "extraFiles": [
+    {
+      "from": "venv/",
+      "to": "venv",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "jarvis_backend/",
+      "to": "jarvis_backend",
+      "filter": [
+        "**/*",
+        "!**/__pycache__/**",
+        "!**/*.pyc",
+        "!.env",
+        "!**/*.db",
+        "!**/*.db-journal",
+        "!**/*.sqlite"
+      ]
+    },
+    {
+      "from": "jarvis_frontend/dist/",
+      "to": "jarvis_frontend/dist",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "build/icons/",
+      "to": "build/icons",
+      "filter": ["**/*"]
+    }
+  ],
+  "linux": {
+    "target": [
+      {
+        "target": "AppImage",
+        "arch": ["x64"]
+      }
+    ],
+    "category": "Utility",
+    "icon": "build/icons",
+    "maintainer": "JARVIS Team <noreply@jarvis.app>",
+    "synopsis": "Voice-first AI Assistant",
+    "desktop": {
+      "Name": "JARVIS",
+      "Comment": "Voice-first AI Assistant",
+      "StartupNotify": "true",
+      "Terminal": "false",
+      "Type": "Application",
+      "Categories": "Utility;Audio;Speech;"
+    }
+  },
+  "mac": {
+    "category": "public.app-category.utilities",
+    "icon": "build/icons/icon-512.png"
+  },
+  "win": {
+    "icon": "build/icons/icon-512.png"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true
+  },
+  "compression": "maximum",
+  "asar": true,
+  "afterPack": "./scripts/fix-fuse-after-pack.js",
+  "publish": {
+    "provider": "github",
+    "owner": "jarvis-ai",
+    "repo": "jarvis-desktop"
+  }
+}

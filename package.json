@@ -1,0 +1,30 @@
+{
+  "name": "jarvis-electron",
+  "version": "1.0.0",
+  "description": "JARVIS Voice Assistant - Native Desktop Application",
+  "productName": "JARVIS",
+  "main": "electron/main.js",
+  "homepage": "https://github.com/jarvis-ai/jarvis-desktop",
+  "author": {
+    "name": "JARVIS Team"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "cd jarvis_frontend && npm run build",
+    "build:install": "cd jarvis_frontend && npm install",
+    "package-backend": "bash scripts/prepare-venv.sh",
+    "fix-electron-binary": "node scripts/fix-electron-binary.js",
+    "postinstall": "node scripts/fix-electron-binary.js",
+    "build:app": "npm run build:install && npm run build && npm run package-backend && electron-builder --config electron-builder.json",
+    "electron": "npm run fix-electron-binary && electron --no-sandbox --disable-gpu electron/main.js",
+    "start": "npm run electron",
+    "pack": "npm run build:install && npm run build && electron-builder --config electron-builder.json",
+    "release": "npm run build:app -- --publish always"
+  },
+  "devDependencies": {
+    "@electron/fuses": "^1.8.0",
+    "electron": "^30.5.1",
+    "electron-builder": "^25.0.0",
+    "electron-updater": "^6.1.7"
+  }
+}
