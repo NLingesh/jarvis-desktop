@@ -1,183 +1,125 @@
-import json
-import os
-from typing import List, Dict, Optional
-from datetime import datetime
+"""NotesModule — adapter from the JSON notes API onto the Markdown vault.
+
+Keeps the legacy ``/api/notes`` interface (``notebook``-scoped, id-based)
+while delegating all storage to the vault. Notebooks map to vault folders
+(``default`` -> the ``Notes/`` folder, anything else -> ``<name>/``) and every
+note becomes a plain Obsidian-compatible ``.md`` file.
+
+The vault holds a stable UUID ``id`` in each note's frontmatter, which is what
+the id-based operations below key on.
+"""
+
 import logging
+
+from modules.vault.manager import VaultManager
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_NOTEBOOK_FOLDER = "Notes"
+
+
+def _folder_for(notebook: str) -> str:
+    notebook = (notebook or "default").strip().strip("/")
+    return notebook if notebook and notebook != "default" else DEFAULT_NOTEBOOK_FOLDER
+
+
 class NotesModule:
-    def __init__(self, notes_dir: str = "~/.jarvis/notes"):
-        self.notes_dir = os.path.expanduser(notes_dir)
-        os.makedirs(self.notes_dir, exist_ok=True)
-    
+    def __init__(self, notes_dir: str | None = None, vault: VaultManager | None = None):
+        if vault is not None:
+            self._vault = vault
+        else:
+            self._vault = VaultManager(notes_dir or "~/.jarvis/notes")
+
+    def _to_note(self, meta: dict, notebook: str) -> dict:
+        return {
+            "id": meta["id"],
+            "title": meta["title"],
+            "content": meta["body"],
+            "tags": meta["tags"],
+            "notebook": notebook,
+            "created_at": meta.get("created"),
+            "modified_at": meta.get("modified"),
+            "path": meta["path"],
+        }
+
+    async def _find(self, note_id: str, notebook: str) -> dict | None:
+        folder = _folder_for(notebook)
+        notes = await self._vault.list_notes(folder=folder, limit=100000)
+        for meta in notes:
+            if meta["id"] == note_id:
+                return meta
+        return None
+
     async def create_note(
-        self,
-        title: str,
-        content: str,
-        tags: Optional[List[str]] = None,
-        notebook: str = "default"
-    ) -> Dict:
-        """Create a new note"""
+        self, title: str, content: str, tags: list[str] | None = None, notebook: str = "default"
+    ) -> dict:
+        """Create a new note in the vault's notebook folder."""
         try:
-            note_id = self._generate_id()
-            
-            note_data = {
-                "id": note_id,
-                "title": title,
-                "content": content,
-                "tags": tags or [],
-                "notebook": notebook,
-                "created_at": datetime.now().isoformat(),
-                "modified_at": datetime.now().isoformat()
-            }
-            
-            # Ensure notebook directory exists
-            notebook_path = os.path.join(self.notes_dir, notebook)
-            os.makedirs(notebook_path, exist_ok=True)
-            
-            # Save note
-            note_file = os.path.join(notebook_path, f"{note_id}.json")
-            with open(note_file, "w") as f:
-                json.dump(note_data, f, indent=2)
-            
-            logger.info(f"Created note: {title}")
-            return note_data
-        
+            meta = await self._vault.create_note(
+                title, content=content, tags=tags or [], folder=_folder_for(notebook)
+            )
+            return self._to_note(meta, notebook)
         except Exception as e:
-            logger.error(f"Failed to create note: {e}")
+            logger.error("Failed to create note: %s", e)
             return {}
-    
-    async def get_notes(self, notebook: str = "default") -> List[Dict]:
-        """Get all notes from a notebook"""
+
+    async def get_notes(self, notebook: str = "default") -> list[dict]:
+        """Get all notes from a notebook (newest first)."""
+        folder = _folder_for(notebook)
         try:
-            notebook_path = os.path.join(self.notes_dir, notebook)
-            
-            if not os.path.exists(notebook_path):
-                return []
-            
-            notes = []
-            for filename in os.listdir(notebook_path):
-                if filename.endswith(".json"):
-                    file_path = os.path.join(notebook_path, filename)
-                    with open(file_path, "r") as f:
-                        note = json.load(f)
-                        notes.append(note)
-            
-            # Sort by modification time (newest first)
-            notes.sort(
-                key=lambda x: x.get("modified_at", ""),
-                reverse=True
-            )
-            
-            return notes
-        
+            notes = await self._vault.list_notes(folder=folder, limit=100000)
+            return [self._to_note(meta, notebook) for meta in notes]
         except Exception as e:
-            logger.error(f"Failed to get notes: {e}")
+            logger.error("Failed to get notes: %s", e)
             return []
-    
-    async def get_note(self, note_id: str, notebook: str = "default") -> Optional[Dict]:
-        """Get a specific note"""
-        try:
-            note_file = os.path.join(
-                self.notes_dir,
-                notebook,
-                f"{note_id}.json"
-            )
-            
-            if not os.path.exists(note_file):
-                return None
-            
-            with open(note_file, "r") as f:
-                return json.load(f)
-        
-        except Exception as e:
-            logger.error(f"Failed to get note {note_id}: {e}")
+
+    async def get_note(self, note_id: str, notebook: str = "default") -> dict | None:
+        """Get a specific note by id."""
+        meta = await self._find(note_id, notebook)
+        if meta is None:
             return None
-    
+        return self._to_note(meta, notebook)
+
     async def update_note(
         self,
         note_id: str,
-        title: Optional[str] = None,
-        content: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        notebook: str = "default"
+        title: str | None = None,
+        content: str | None = None,
+        tags: list[str] | None = None,
+        notebook: str = "default",
     ) -> bool:
-        """Update an existing note"""
+        """Update an existing note."""
+        meta = await self._find(note_id, notebook)
+        if meta is None:
+            return False
         try:
-            note = await self.get_note(note_id, notebook)
-            if not note:
-                return False
-            
-            if title:
-                note["title"] = title
-            if content:
-                note["content"] = content
-            if tags is not None:
-                note["tags"] = tags
-            
-            note["modified_at"] = datetime.now().isoformat()
-            
-            note_file = os.path.join(
-                self.notes_dir,
-                notebook,
-                f"{note_id}.json"
-            )
-            
-            with open(note_file, "w") as f:
-                json.dump(note, f, indent=2)
-            
-            logger.info(f"Updated note: {note_id}")
+            await self._vault.update_note(meta["path"], title=title, content=content, tags=tags)
             return True
-        
         except Exception as e:
-            logger.error(f"Failed to update note: {e}")
+            logger.error("Failed to update note %s: %s", note_id, e)
             return False
-    
+
     async def delete_note(self, note_id: str, notebook: str = "default") -> bool:
-        """Delete a note"""
-        try:
-            note_file = os.path.join(
-                self.notes_dir,
-                notebook,
-                f"{note_id}.json"
-            )
-            
-            if os.path.exists(note_file):
-                os.remove(note_file)
-                logger.info(f"Deleted note: {note_id}")
-                return True
-            
+        """Delete a note."""
+        meta = await self._find(note_id, notebook)
+        if meta is None:
             return False
-        
-        except Exception as e:
-            logger.error(f"Failed to delete note: {e}")
-            return False
-    
-    async def search_notes(
-        self,
-        query: str,
-        notebook: str = "default"
-    ) -> List[Dict]:
-        """Search notes by title or content"""
         try:
-            notes = await self.get_notes(notebook)
-            query_lower = query.lower()
-            
-            results = [
-                note for note in notes
-                if query_lower in note.get("title", "").lower()
-                or query_lower in note.get("content", "").lower()
-                or any(query_lower in tag.lower() for tag in note.get("tags", []))
-            ]
-            
-            return results
-        
+            await self._vault.delete_note(meta["path"])
+            return True
         except Exception as e:
-            logger.error(f"Failed to search notes: {e}")
-            return []
-    
-    def _generate_id(self) -> str:
-        """Generate unique note ID"""
-        import uuid
-        return str(uuid.uuid4())[:8]
+            logger.error("Failed to delete note %s: %s", note_id, e)
+            return False
+
+    async def search_notes(self, query: str, notebook: str = "default") -> list[dict]:
+        """Search notes by title, content, or tag."""
+        query_lower = (query or "").lower()
+        notes = await self.get_notes(notebook)
+        results = [
+            note
+            for note in notes
+            if query_lower in note.get("title", "").lower()
+            or query_lower in note.get("content", "").lower()
+            or any(query_lower in tag.lower() for tag in note.get("tags", []))
+        ]
+        return results

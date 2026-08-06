@@ -1,10 +1,8 @@
-import os
-import re
-import shutil
+import contextlib
 import logging
-from pathlib import Path
-from typing import Optional, List, Dict
-from dataclasses import dataclass, field
+import os
+import shutil
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +23,20 @@ MAX_READ_CHARS = 32000
 @dataclass
 class DocumentResult:
     success: bool
-    content: Optional[str] = None
-    error: Optional[str] = None
+    content: str | None = None
+    error: str | None = None
     truncated: bool = False
-    filename: Optional[str] = None
+    filename: str | None = None
 
 
 class DocumentsModule:
     ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".docx", ".pdf"}
     ALLOWED_WRITE_EXTENSIONS = {".txt", ".md", ".docx"}
 
-    def __init__(self, root: Optional[str] = None):
-        raw_root = root or os.getenv("DOCUMENTS_ROOT", os.path.join(os.path.expanduser("~"), "Documents", "jarvis"))
+    def __init__(self, root: str | None = None):
+        raw_root = root or os.getenv(
+            "DOCUMENTS_ROOT", os.path.join(os.path.expanduser("~"), "Documents", "jarvis")
+        )
         self.root = os.path.realpath(os.path.abspath(os.path.expanduser(raw_root)))
         os.makedirs(self.root, exist_ok=True)
 
@@ -54,7 +54,7 @@ class DocumentsModule:
     def _extract_text(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
         if ext == ".txt" or ext == ".md" or ext == ".csv":
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 return f.read()
         if ext == ".docx":
             if docx is None:
@@ -67,14 +67,12 @@ class DocumentsModule:
             reader = PdfReader(path)
             parts = []
             for page in reader.pages:
-                try:
+                with contextlib.suppress(Exception):
                     parts.append(page.extract_text() or "")
-                except Exception:
-                    pass
             return "\n".join(parts)
         raise ValueError(f"Unsupported file type: {ext}")
 
-    def list_documents(self, query: Optional[str] = None) -> List[str]:
+    def list_documents(self, query: str | None = None) -> list[str]:
         try:
             entries = []
             for name in os.listdir(self.root):
@@ -92,23 +90,32 @@ class DocumentsModule:
             return DocumentResult(success=False, error="File not found", filename=filename)
         ext = os.path.splitext(path)[1].lower()
         if ext not in self.ALLOWED_EXTENSIONS:
-            return DocumentResult(success=False, error=f"Unsupported file type: {ext}", filename=filename)
+            return DocumentResult(
+                success=False, error=f"Unsupported file type: {ext}", filename=filename
+            )
         try:
             text = self._extract_text(path)
             text, truncated = self._token_budget_truncate(text)
             note = " (truncated to ~8000 tokens)" if truncated else ""
-            return DocumentResult(success=True, content=text + note, truncated=truncated, filename=filename)
+            return DocumentResult(
+                success=True, content=text + note, truncated=truncated, filename=filename
+            )
         except Exception as e:
             logger.error(f"Failed to read document {filename}: {e}")
             return DocumentResult(success=False, error=str(e), filename=filename)
 
-    def create_document(self, filename: str, content: str = "", overwrite: bool = False) -> DocumentResult:
+    def create_document(
+        self, filename: str, content: str = "", overwrite: bool = False
+    ) -> DocumentResult:
         path = self._resolve(filename)
         ext = os.path.splitext(path)[1].lower()
         if ext not in self.ALLOWED_WRITE_EXTENSIONS:
             return DocumentResult(success=False, error=f"Unsupported file type for creation: {ext}")
         if os.path.exists(path) and not overwrite:
-            return DocumentResult(success=False, error=f"File already exists: {filename}. Set overwrite to true to replace it.")
+            return DocumentResult(
+                success=False,
+                error=f"File already exists: {filename}. Set overwrite to true to replace it.",
+            )
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             if ext == ".docx":
@@ -132,9 +139,11 @@ class DocumentsModule:
         try:
             if shutil.which("xdg-open"):
                 import subprocess
+
                 subprocess.Popen(["xdg-open", path])
             else:
                 import subprocess
+
                 subprocess.Popen(["open", path])
             return DocumentResult(success=True, filename=filename)
         except Exception as e:

@@ -1,18 +1,19 @@
-import re
-import logging
 import asyncio
-from typing import Any, Callable, Dict, List, Optional
+import logging
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class Skill:
     """Declarative skill metadata."""
+
     def __init__(
         self,
         name: str,
-        intents: List[str],
-        handler: Callable[[str, Optional[str]], Dict[str, Any]],
+        intents: list[str],
+        handler: Callable[[str, str | None], dict[str, Any]],
         description: str = "",
     ):
         self.name = name
@@ -30,15 +31,15 @@ class SkillRegistry:
     """
 
     def __init__(self):
-        self._skills: Dict[str, Skill] = {}
+        self._skills: dict[str, Skill] = {}
 
     def register(self, skill: Skill) -> None:
         self._skills[skill.name] = skill
 
-    def get(self, name: str) -> Optional[Skill]:
+    def get(self, name: str) -> Skill | None:
         return self._skills.get(name)
 
-    def detect_intents(self, user_input: str) -> List[str]:
+    def detect_intents(self, user_input: str) -> list[str]:
         """Return skill names whose intents match the user input."""
         lower = user_input.lower()
         matches = []
@@ -47,7 +48,7 @@ class SkillRegistry:
                 matches.append(name)
         return matches
 
-    async def execute(self, user_input: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    async def execute(self, user_input: str, session_id: str | None = None) -> dict[str, Any]:
         """Run matched skills sequentially and merge results.
 
         Returns a context dict with per-skill outputs.
@@ -56,7 +57,7 @@ class SkillRegistry:
         if not intents:
             return {}
 
-        merged: Dict[str, Any] = {}
+        merged: dict[str, Any] = {}
         for name in intents:
             skill = self._skills.get(name)
             if not skill:
@@ -72,9 +73,8 @@ class SkillRegistry:
                 merged[name] = {"error": str(e)}
         return merged
 
-    def list_skills(self) -> List[Dict[str, str]]:
+    def list_skills(self) -> list[dict[str, str]]:
         return [
             {"name": s.name, "description": s.description, "intents": s.intents}
             for s in self._skills.values()
         ]
-

@@ -1,13 +1,15 @@
-import os
+import asyncio
 import base64
-import subprocess
+import contextlib
+import logging
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
-from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
+
 
 class TextToSpeechModule:
     def __init__(self):
@@ -16,7 +18,7 @@ class TextToSpeechModule:
         self.use_elevenlabs = bool(self.elevenlabs_api_key)
         self.edge_tts_voice = os.getenv("EDGE_TTS_VOICE", "en-US-GuyNeural")
 
-    async def generate_speech(self, text: str, voice_id: Optional[str] = None) -> str:
+    async def generate_speech(self, text: str, voice_id: str | None = None) -> str:
         """Generate speech and return as base64 audio"""
         if self.use_elevenlabs:
             try:
@@ -33,7 +35,7 @@ class TextToSpeechModule:
 
         return await self._system_tts(text)
 
-    async def _elevenlabs_tts(self, text: str, voice_id: Optional[str] = None) -> bytes:
+    async def _elevenlabs_tts(self, text: str, voice_id: str | None = None) -> bytes:
         """Call ElevenLabs API"""
         import httpx
 
@@ -42,18 +44,12 @@ class TextToSpeechModule:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                headers={
-                    "xi-api-key": self.elevenlabs_api_key,
-                    "Content-Type": "application/json"
-                },
+                headers={"xi-api-key": self.elevenlabs_api_key, "Content-Type": "application/json"},
                 json={
                     "text": text,
                     "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {
-                        "stability": 0.75,
-                        "similarity_boost": 0.75
-                    }
-                }
+                    "voice_settings": {"stability": 0.75, "similarity_boost": 0.75},
+                },
             )
 
             if response.status_code == 200:
@@ -61,7 +57,7 @@ class TextToSpeechModule:
 
             raise Exception(f"ElevenLabs API error: {response.status_code} {response.text}")
 
-    async def stream_speech(self, text: str, voice_id: Optional[str] = None):
+    async def stream_speech(self, text: str, voice_id: str | None = None):
         """Stream speech audio in base64-encoded chunks.
 
         Yields base64 strings for successive chunks. If ElevenLabs is not available,
@@ -69,18 +65,19 @@ class TextToSpeechModule:
         """
         if self.use_elevenlabs:
             import httpx
+
             voice_id = voice_id or self.voice_id
 
             async with httpx.AsyncClient(timeout=None) as client:
                 url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
                 headers = {
                     "xi-api-key": self.elevenlabs_api_key,
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
                 }
                 payload = {
                     "text": text,
                     "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {"stability": 0.75, "similarity_boost": 0.75}
+                    "voice_settings": {"stability": 0.75, "similarity_boost": 0.75},
                 }
                 try:
                     async with client.stream("POST", url, headers=headers, json=payload) as r:
@@ -97,6 +94,7 @@ class TextToSpeechModule:
         # Edge TTS (Microsoft neural voices, no API key required)
         try:
             import edge_tts
+
             communicate = edge_tts.Communicate(text, self.edge_tts_voice)
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio" and chunk.get("data"):
@@ -130,25 +128,26 @@ class TextToSpeechModule:
             return ""
 
         suffix = ".wav" if tts_engine != "piper" else ".wav"
-        tmp = tempfile.NamedTemporaryFile(suffix=suffix, prefix="jarvis_tts_", delete=False)
-        audio_path = tmp.name
-        tmp.close()
+        with tempfile.NamedTemporaryFile(suffix=suffix, prefix="jarvis_tts_", delete=False) as tmp:
+            audio_path = tmp.name
         try:
             if tts_engine in ["espeak-ng", "espeak"]:
-                subprocess.run(
+                await asyncio.to_thread(
+                    subprocess.run,
                     [tts_engine, "-w", audio_path, text],
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
                 )
             elif tts_engine == "piper":
-                subprocess.run(
+                await asyncio.to_thread(
+                    subprocess.run,
                     ["piper", "--tts", "--voice", "alloy", "--output", audio_path, "--text", text],
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
                 )
             else:
                 raise FileNotFoundError("Unsupported TTS engine")
@@ -167,23 +166,21 @@ class TextToSpeechModule:
             logger.error("Local TTS binary not found")
             return ""
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(audio_path)
-            except OSError:
-                pass
 
     async def _macos_say(self, text: str) -> str:
         """Fallback to macOS say command"""
-        tmp = tempfile.NamedTemporaryFile(suffix=".aiff", prefix="jarvis_tts_", delete=False)
-        audio_path = tmp.name
-        tmp.close()
+        with tempfile.NamedTemporaryFile(suffix=".aiff", prefix="jarvis_tts_", delete=False) as tmp:
+            audio_path = tmp.name
         try:
-            subprocess.run(
+            await asyncio.to_thread(
+                subprocess.run,
                 ["say", "-o", audio_path, text],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
             )
 
             with open(audio_path, "rb") as f:
@@ -194,12 +191,10 @@ class TextToSpeechModule:
             logger.error(f"macOS say failed: {e}")
             return ""
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(audio_path)
-            except OSError:
-                pass
 
-    def _find_tts_engine(self) -> Optional[str]:
+    def _find_tts_engine(self) -> str | None:
         """Detect an available local TTS engine"""
         for engine in ["espeak-ng", "espeak", "piper"]:
             if shutil.which(engine):

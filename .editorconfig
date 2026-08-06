@@ -1,0 +1,17 @@
+[*.{js,jsx,ts,tsx}]
+charset = "utf-8"
+end_style = "lf"
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{ts,tsx}]
+indent_style = "space"
+indent_size = 2
+
+[*.py]
+charset = "utf-8"
+end_style = "lf"
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = "space"
+indent_size = 4

@@ -1,17 +1,18 @@
-import os
 import base64
 import io
 import json
-import wave
 import logging
-from typing import Optional
+import os
+import threading
+import wave
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 try:
-    from vosk import Model, KaldiRecognizer
+    from vosk import KaldiRecognizer, Model
+
     VOSK_AVAILABLE = True
 except Exception:
     VOSK_AVAILABLE = False
@@ -31,12 +32,15 @@ class SpeechToTextModule:
         "vosk-model-small-en-us-0.15",
     )
 
-    def __init__(self, model_dir: Optional[str] = None):
+    def __init__(self, model_dir: str | None = None):
         self.model_dir = model_dir or os.getenv("VOSK_MODEL_DIR") or self.DEFAULT_MODEL_DIR
         self._model = None
         self._recognizer = None
+        self._load_lock = threading.Lock()
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_api_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/audio/transcriptions")
+        self.openai_api_url = os.getenv(
+            "OPENAI_API_URL", "https://api.openai.com/v1/audio/transcriptions"
+        )
 
     @property
     def available(self) -> bool:
@@ -47,12 +51,15 @@ class SpeechToTextModule:
             return True
         if not self.available:
             return False
-        try:
-            self._model = Model(self.model_dir)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load Vosk model from {self.model_dir}: {e}")
-            return False
+        with self._load_lock:
+            if self._model is not None:
+                return True
+            try:
+                self._model = Model(self.model_dir)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to load Vosk model from {self.model_dir}: {e}")
+                return False
 
     def transcribe_wav(self, wav_bytes: bytes) -> str:
         """Transcribe PCM16 mono 16kHz WAV audio bytes."""
@@ -65,7 +72,7 @@ class SpeechToTextModule:
                         raise ValueError(f"Expected mono audio, got {channels} channels")
                     data = wf.readframes(wf.getnframes())
             except (wave.Error, ValueError, EOFError) as e:
-                raise ValueError(f"Could not parse WAV audio: {e}")
+                raise ValueError(f"Could not parse WAV audio: {e}") from e
 
             try:
                 recognizer = KaldiRecognizer(self._model, rate)
@@ -99,7 +106,7 @@ class SpeechToTextModule:
                 return ""
         except Exception as e:
             logger.error(f"Cloud STT failed: {e}")
-            raise RuntimeError(f"Cloud speech recognition failed: {e}")
+            raise RuntimeError(f"Cloud speech recognition failed: {e}") from e
 
     def transcribe_base64(self, audio_base64: str) -> str:
         """Transcribe audio given as a base64 WAV payload."""
@@ -109,4 +116,3 @@ class SpeechToTextModule:
     @property
     def has_cloud_fallback(self) -> bool:
         return bool(self.openai_api_key)
-

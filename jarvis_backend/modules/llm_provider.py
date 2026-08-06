@@ -1,10 +1,10 @@
-import os
+import asyncio
+import contextlib
 import json
 import logging
-from typing import List, Dict, Optional
+import os
 
 import httpx
-import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class LLMProvider:
         if self.provider == "anthropic":
             try:
                 from .claude_api import ClaudeAPI
+
                 self.client = ClaudeAPI()
             except Exception as e:
                 logger.error("Failed to initialize Anthropic client: %s", e)
@@ -63,10 +64,9 @@ class LLMProvider:
                     f"- [{r.get('role', 'user')}] {r.get('content', '')}"
                     for r in memory_results[:5]
                 )
-                messages.append({
-                    "role": "system",
-                    "content": f"Relevant past conversations:\n{memory_text}"
-                })
+                messages.append(
+                    {"role": "system", "content": f"Relevant past conversations:\n{memory_text}"}
+                )
             except Exception:
                 pass
 
@@ -88,15 +88,17 @@ class LLMProvider:
     async def get_response(
         self,
         user_message: str,
-        conversation_history: List[Dict],
-        context: Optional[Dict] = None,
-        memory_results: Optional[List[Dict]] = None,
+        conversation_history: list[dict],
+        context: dict | None = None,
+        memory_results: list[dict] | None = None,
     ) -> str:
         """Return a single text response from the configured LLM provider."""
         if self.provider == "anthropic":
             if not self.client:
                 return "Anthropic client unavailable"
-            return await self.client.get_response(user_message, conversation_history, context, memory_results)
+            return await self.client.get_response(
+                user_message, conversation_history, context, memory_results
+            )
 
         if self.provider == "mistral":
             # Use chat-style payloads where possible for better instruction-following
@@ -105,7 +107,9 @@ class LLMProvider:
                 headers["Authorization"] = f"Bearer {self.api_key}"
 
             # Build messages: persona/memory/context -> conversation -> user
-            messages = self._build_messages(user_message, conversation_history, context, memory_results)
+            messages = self._build_messages(
+                user_message, conversation_history, context, memory_results
+            )
 
             payload_chat = {"model": self.model, "messages": messages}
 
@@ -173,11 +177,19 @@ class LLMProvider:
 
         return "No provider configured"
 
-    async def get_response_stream(self, user_message: str, conversation_history: List[Dict], context: Optional[Dict] = None, memory_results: Optional[List[Dict]] = None):
+    async def get_response_stream(
+        self,
+        user_message: str,
+        conversation_history: list[dict],
+        context: dict | None = None,
+        memory_results: list[dict] | None = None,
+    ):
         """Stream text chunks from the configured LLM provider as they arrive."""
         if self.provider == "anthropic" and getattr(self, "client", None):
             try:
-                async for chunk in self.client.stream_response(user_message, conversation_history, context, memory_results):
+                async for chunk in self.client.stream_response(
+                    user_message, conversation_history, context, memory_results
+                ):
                     if chunk:
                         yield chunk
                 return
@@ -185,7 +197,9 @@ class LLMProvider:
                 pass
 
         if self.provider == "mistral":
-            messages = self._build_messages(user_message, conversation_history, context, memory_results)
+            messages = self._build_messages(
+                user_message, conversation_history, context, memory_results
+            )
 
             headers = {"Content-Type": "application/json"}
             if getattr(self, "api_key", None):
@@ -196,7 +210,7 @@ class LLMProvider:
             url_options = [
                 f"{self.api_url.rstrip('/')}/v1/chat/completions",
                 f"{self.api_url.rstrip('/')}/v1/generate",
-                f"{self.api_url.rstrip('/')}/v1/streams"
+                f"{self.api_url.rstrip('/')}/v1/streams",
             ]
 
             async with httpx.AsyncClient(timeout=None) as client:
@@ -210,7 +224,7 @@ class LLMProvider:
                                 if not line:
                                     continue
                                 if line.startswith("data: "):
-                                    line = line[len("data: "):]
+                                    line = line[len("data: ") :]
                                 line = line.strip()
                                 if line in ("[DONE]", "DONE"):
                                     return
@@ -221,25 +235,17 @@ class LLMProvider:
                                     continue
 
                                 text_chunk = None
-                                try:
+                                with contextlib.suppress(Exception):
                                     text_chunk = payload_obj["outputs"][0]["content"][0]["text"]
-                                except Exception:
-                                    pass
                                 if not text_chunk:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         text_chunk = payload_obj["choices"][0]["delta"]["content"]
-                                    except Exception:
-                                        pass
                                 if not text_chunk:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         text_chunk = payload_obj["choices"][0]["text"]
-                                    except Exception:
-                                        pass
                                 if not text_chunk:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         text_chunk = payload_obj["generated_text"]
-                                    except Exception:
-                                        pass
 
                                 if text_chunk:
                                     yield text_chunk
@@ -253,7 +259,7 @@ class LLMProvider:
         full = await self.get_response(user_message, conversation_history, context, memory_results)
         yield full
 
-    async def rerank(self, query: str, passages: List[str], model: Optional[str] = None) -> Dict:
+    async def rerank(self, query: str, passages: list[str], model: str | None = None) -> dict:
         """Call a reranking endpoint (e.g., NVIDIA reranker) and return JSON.
 
         Expects environment variables for credentials:
@@ -261,13 +267,15 @@ class LLMProvider:
         - `NVIDIA_RERANK_URL` optionally to override the default endpoint
         """
         model = model or os.getenv("NVIDIA_RERANK_MODEL", "nv-rerank-qa-mistral-4b:1")
-        invoke_url = os.getenv("NVIDIA_RERANK_URL", "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking")
+        invoke_url = os.getenv(
+            "NVIDIA_RERANK_URL", "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking"
+        )
 
         # Build passages payload structure matching your example
         payload = {
             "model": model,
             "query": {"text": query},
-            "passages": [{"text": p} for p in passages]
+            "passages": [{"text": p} for p in passages],
         }
 
         # Authorization: allow user to provide raw header or just a bearer token

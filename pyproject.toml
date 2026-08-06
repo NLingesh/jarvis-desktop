@@ -1,0 +1,50 @@
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  | venv
+  | node_modules
+  | squashfs-root
+  | __pycache__
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["jarvis_backend"]
+extend-exclude = [
+  "venv",
+  "node_modules",
+  "squashfs-root",
+  "__pycache__",
+  "build",
+  "release",
+]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes
+  "I",   # isort
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+  "SIM", # flake8-simplify
+  "C4",  # flake8-comprehensions
+]
+ignore = [
+  "E501",  # line-too-long — handled by black
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jarvis_backend", "modules", "routes"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true

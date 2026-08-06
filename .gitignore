@@ -22,3 +22,10 @@ jarvis_memory.db
 *.sqlite
 .vite/
 *.tsbuildinfo
+.coverage
+htmlcov/
+coverage/
+jarvis_backend/models/
+release/
+.env.odt
+*.wav

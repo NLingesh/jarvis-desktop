@@ -23,7 +23,12 @@ interface SettingsProps {
   onSave: (settings: SettingsState, emailConfig: EmailConfig) => void;
 }
 
-const Settings: React.FC<SettingsProps> = ({ onClose, settings: initialSettings, emailConfig: initialEmailConfig, onSave }) => {
+const Settings: React.FC<SettingsProps> = ({
+  onClose,
+  settings: initialSettings,
+  emailConfig: initialEmailConfig,
+  onSave,
+}) => {
   const [settings, setSettings] = useState<SettingsState>(initialSettings);
   const [emailConfig, setEmailConfig] = useState<EmailConfig>(initialEmailConfig);
 
@@ -36,16 +41,16 @@ const Settings: React.FC<SettingsProps> = ({ onClose, settings: initialSettings,
   }, [initialEmailConfig]);
 
   const handleSettingChange = (key: keyof SettingsState, value: any) => {
-    setSettings(prev => ({
+    setSettings((prev) => ({
       ...prev,
-      [key]: value
+      [key]: value,
     }));
   };
 
   const handleEmailChange = (key: keyof EmailConfig, value: string) => {
-    setEmailConfig(prev => ({
+    setEmailConfig((prev) => ({
       ...prev,
-      [key]: value
+      [key]: value,
     }));
   };
 
@@ -59,7 +64,9 @@ const Settings: React.FC<SettingsProps> = ({ onClose, settings: initialSettings,
       <div className="settings-panel">
         <div className="settings-header">
           <h2>Settings</h2>
-          <button className="close-btn" onClick={onClose}>✕</button>
+          <button className="close-btn" onClick={onClose}>
+            ✕
+          </button>
         </div>
 
         <div className="settings-content">
@@ -176,9 +183,7 @@ const Settings: React.FC<SettingsProps> = ({ onClose, settings: initialSettings,
                 onChange={(e) => handleEmailChange('appPassword', e.target.value)}
                 placeholder="app-specific password"
               />
-              <small>
-                For Gmail: Use an App Password (not your regular password)
-              </small>
+              <small>For Gmail: Use an App Password (not your regular password)</small>
             </div>
           </div>
 

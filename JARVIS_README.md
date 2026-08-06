@@ -1,33 +1,41 @@
 # JARVIS — Voice AI Assistant
 
-A production-ready voice-first AI assistant for Linux that integrates with your calendar, email, notes, and the web. Powered by Mistral-4b with streaming support, built with FastAPI + React + Three.js.
+A voice-first AI assistant for Linux that integrates with your calendar, email, notes, documents, and the web. JARVIS runs as an Electron desktop app (or in the browser) with a FastAPI + React + Three.js backend, and streams text + audio for a hands-free experience.
 
 ## Features
 
-- 🎤 **Voice Input/Output** — Hands-free interaction using Web Speech API + ElevenLabs TTS streaming
-- 📅 **Calendar Integration** — Access and manage your calendar events via voice
-- 📧 **Email Management** — Read, send, and manage emails by voice
+- 🎤 **Offline Speech Recognition** — Vosk STT runs locally, no API key needed (OpenAI Whisper fallback optional)
+- 🔊 **Streaming TTS** — ElevenLabs → Microsoft Edge TTS → system `espeak`/`piper` fallback chain
+- 📅 **Calendar Integration** — Access and manage calendar events via voice
+- 📧 **Email Management** — Read, send, and manage emails by voice (IMAP/SMTP)
 - 📝 **Notes** — Create and organize notes through natural conversation
-- 🌐 **Web Browsing** — Search the web and fetch information
+- 📄 **Document Control** — Create, read, edit, append, replace, and delete documents by voice, with confirmation prompts for destructive actions
+- 🌐 **Web Browsing** — Search the web, check weather, translate text
 - 🖥️ **System Info** — Monitor CPU, memory, disk, and processes
-- 🔊 **Audio-Reactive Orb** — Three.js particle visualization that reacts to audio
+- 🪄 **Skill Registry** — Declarative intent-based routing to modules
 - 💬 **Conversation Memory** — SQLite with FTS5 for fast full-text search
-- ⚡ **Streaming Responses** — Real-time text and audio chunks for low-latency interaction
-- 🤖 **Provider-Agnostic LLM** — Supports Mistral (primary) and Anthropic (fallback)
+- ⚡ **Streaming Responses** — Real-time `partial` text + segmented audio chunks
+- 🤖 **Provider-Agnostic LLM** — Mistral (primary) with Anthropic fallback
 - 🎯 **NVIDIA Reranking** — Optional semantic reranking for better search results
-- 🔒 **Privacy-First** — All conversations stored locally
+- 💻 **Desktop App** — Electron shell with tray, floating bubble, wake-word, and auto-updates
+- 🔒 **Privacy-First** — Conversations stored locally; session-token auth on the WebSocket and API
 
 ## Architecture
 
 ```
-Microphone → Web Speech API → WebSocket → FastAPI (Python)
-↓
-Mistral-4b API (with streaming)
-↓
-ElevenLabs TTS (streaming) → Browser Speaker
-
-Alternative: Anthropic (Claude) if MISTRAL provider unavailable
-Optional: NVIDIA Reranker for semantic search
+Electron / Browser (React + Three.js)
+├── VoiceOrb (audio-reactive particle visualization)
+├── Bubble (floating always-on-top orb, desktop only)
+└── MediaRecorder → WAV (PCM16 16 kHz) → WebSocket
+                    ↓
+         FastAPI Backend (Python)  :8000
+├── /ws/voice  (token-authenticated WebSocket)
+│   ├── audio → Vosk STT (offline)
+│   └── text  → Skill Registry → context (calendar/email/web/system/notes/documents)
+│              → LLMProvider (Mistral streaming / Anthropic)
+│              → TTS (ElevenLabs / Edge TTS / espeak)
+│              → partial + audio_queue + audio_chunk* streamed back
+└── /api/*     (REST: system, memory, mail, notes, calendar, llm, stt, settings)
 ```
 
 ## Tech Stack
@@ -35,355 +43,330 @@ Optional: NVIDIA Reranker for semantic search
 | Component | Technology |
 |-----------|-----------|
 | **Backend** | Python 3.11+, FastAPI, SQLite with FTS5 |
-| **Frontend** | TypeScript, React, Vite, Three.js |
+| **Frontend** | TypeScript, React 18, Vite, Three.js |
+| **Desktop** | Electron 30 (tray, bubble window, auto-update) |
 | **Communication** | WebSocket with JSON + base64 audio streaming |
-| **AI - Primary** | Mistral-4b (via mistral.ai API) |
-| **AI - Fallback** | Claude Haiku (Anthropic) |
+| **AI - Primary** | Mistral (via mistral.ai / NVIDIA-hosted API) |
+| **AI - Fallback** | Anthropic Claude |
+| **STT** | Vosk (offline), OpenAI Whisper fallback |
 | **Reranking** | NVIDIA Reranker (optional) |
-| **TTS** | ElevenLabs (with espeak-ng fallback) |
+| **TTS** | ElevenLabs → Edge TTS → espeak/piper |
 | **Containerization** | Docker & Docker Compose |
 
 ## Prerequisites
 
 - Python 3.11+
-- Node.js 18+
-- Docker & Docker Compose (optional)
-- **MISTRAL_API_KEY** (primary) — get from https://console.mistral.ai/
-- **or ANTHROPIC_API_KEY** (fallback) — get from https://console.anthropic.com/
-- **ELEVENLABS_API_KEY** (optional) — get from https://elevenlabs.io/
+- Node.js 18+ (for frontend build / dev only)
+- **MISTRAL_API_KEY** (primary) — https://console.mistral.ai/ (an `nvapi-*` key also works via NVIDIA-hosted models)
+- **or ANTHROPIC_API_KEY** (fallback) — https://console.anthropic.com/
+- **ELEVENLABS_API_KEY** (optional) — https://elevenlabs.io/ (falls back to Edge TTS, then system TTS)
+- **Vosk model** (optional, for offline voice input) — `bash scripts/download-vosk-model.sh`
 
 ## Quick Start
 
-### 1. Clone and Setup
+### One-Command Launch (Recommended)
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd jarvis
-
-# Create environment file
 cp jarvis_backend/.env.example jarvis_backend/.env
-# Edit .env and add your Mistral and/or Anthropic API keys
+# Edit jarvis_backend/.env and add at least one LLM API key
+
+./start.sh        # Mac / Linux   (start.bat on Windows)
 ```
 
-### 2. Backend Setup
+The script creates the virtualenv, installs dependencies, starts the backend, and opens the browser.
+
+### Desktop App
 
 ```bash
-cd jarvis_backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the server
-python main.py
-```
-
-The backend will start on `http://localhost:8000`
-
-### 3. Frontend Setup
-
-```bash
-cd jarvis_frontend
-
-# Install dependencies
+# First time
 npm install
+npm run build:install
 
-# Run development server
-npm run dev
+# Run in development mode (launches Electron + backend)
+npm start
+
+# Package a distributable build
+npm run build:app
 ```
 
-The frontend will start on `http://localhost:5173`
-
-### 4. Access JARVIS
-
-Open your browser to `http://localhost:5173`
-
-## Docker Deployment
-
-### Using Docker Compose (Recommended)
+### Manual — Backend
 
 ```bash
-# Create .env file with your API keys
-cp jarvis_backend/.env.example .env
-
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-```
-
-Access at `http://localhost:5173`
-
-### Manual Docker Build
-
-```bash
-# Build backend
 cd jarvis_backend
-docker build -t jarvis-backend .
-docker run -p 8000:8000 -e ANTHROPIC_API_KEY=your_key jarvis-backend
-
-# Build frontend
-cd jarvis_frontend
-docker build -t jarvis-frontend .
-docker run -p 5173:5173 jarvis-frontend
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # add your API keys
+python main.py         # http://localhost:8000
 ```
+
+### Manual — Frontend (browser dev)
+
+```bash
+cd jarvis_frontend
+npm install
+npm run dev            # http://localhost:5173 (proxies /api + /ws to :8000)
+```
+
+> The backend also serves the production frontend (`jarvis_frontend/dist`) at `http://localhost:8000` when built.
 
 ## Configuration
 
-### Backend (.env file)
+### Backend (.env)
 
 ```bash
-ANTHROPIC_API_KEY=your_key_here
-ELEVENLABS_API_KEY=your_key_here  # Optional
+# LLM (primary: Mistral, fallback: Anthropic)
+LLM_PROVIDER=mistral
+MISTRAL_API_KEY=your-key
+MISTRAL_MODEL=mistralai/mistral-nemotron
+MISTRAL_API_URL=https://api.mistral.ai
+ANTHROPIC_API_KEY=your-key            # optional fallback
+
+# TTS — ElevenLabs optional; Edge TTS is the default fallback
+ELEVENLABS_API_KEY=your-key
+EDGE_TTS_VOICE=en-US-GuyNeural
+
+# Offline speech-to-text (Vosk) — model dir, empty = auto-detect
+VOSK_MODEL_DIR=
+
+# NVIDIA reranking (optional)
+NVIDIA_API_KEY=your-key
+NVIDIA_RERANK_MODEL=nv-rerank-qa-mistral-4b:1
+
+# Email
+EMAIL_IMAP_SERVER=imap.gmail.com
+EMAIL_IMAP_PORT=993
+EMAIL_SMTP_SERVER=smtp.gmail.com
+EMAIL_SMTP_PORT=587
+
+# Server
 SERVER_HOST=127.0.0.1
 SERVER_PORT=8000
+DEBUG=False
+ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000,http://localhost:5173,http://127.0.0.1:5173
+
+# Calendar
+CALENDAR_TYPE=evolution
+
+# Database & documents
+DATABASE_PATH=jarvis_memory.db
+DOCUMENTS_ROOT=~/Documents/jarvis
+ALLOWED_DOCUMENT_EXTENSIONS=.txt,.md,.csv,.docx,.pdf
+ALLOWED_WRITE_EXTENSIONS=.txt,.md,.docx
+
+# Logging
 LOG_LEVEL=INFO
 ```
 
 ### Frontend Settings
 
 Access Settings (⚙️) in the UI to configure:
-- Voice language and speed
-- TTS volume
+- Voice language, volume, speech speed
 - Theme (light/dark)
-- Server URL
-- Email integration
+- Server URL, wake word
+- Email integration (IMAP credentials)
 
 ## Usage
 
 ### Voice Mode
 
-1. **Click the microphone button** (🎤)
-2. **Speak your command** — the system will transcribe and process
-3. **Wait for response** — Claude processes and responds with voice + text
+1. **Tap the orb** (or press `Space`) to start recording — tap again to stop and send
+2. Audio is transcribed offline (Vosk) and processed by the skill registry + LLM
+3. The response streams back as text and segmented audio
 
 ### Text Mode
 
-1. **Type in the text field** at the bottom
-2. **Press Enter or click Send** (✉️)
-3. **Get instant response** with voice feedback
+Type in the input field at the bottom and press Enter.
 
 ### Example Commands
 
 ```
 "What's on my calendar tomorrow?"
 "Send an email to john@example.com saying hello"
-"Create a note: Remember to buy groceries"
+"Remember to buy groceries"                      # creates a note
+"Create a document named ideas.md with content …"
+"Read document notes.txt"
 "Search for Python best practices"
 "What's my system CPU usage?"
 "Translate 'hello' to Spanish"
 "What's the weather like?"
 ```
 
+Destructive document actions (overwrite, replace, delete) require a spoken confirmation ("yes"/"no").
+
 ## Module Structure
 
-### Backend Modules
+### Backend — `jarvis_backend/`
 
-- **`memory.py`** — Conversation history, SQLite FTS5 search, note storage
-- **`claude_api.py`** — Claude Haiku integration with context awareness
-- **`tts.py`** — ElevenLabs text-to-speech with system fallback
-- **`calendar_module.py`** — Evolution/GNOME Calendar integration
-- **`mail_module.py`** — IMAP/SMTP email access
-- **`notes_module.py`** — Local JSON-based note storage
-- **`web_browse.py`** — DuckDuckGo search, weather, news, translation
-- **`system_actions.py`** — CPU, memory, disk, process monitoring
+| File | Purpose |
+|------|---------|
+| `main.py` | FastAPI app, middleware (CSP, rate-limit), WebSocket `/ws/voice` |
+| `routes/` | REST routers: `system`, `memory`, `mail`, `notes`, `calendar`, `llm`, `stt`, `settings` |
+| `routes/state.py` | Shared singletons, session-token auth, skill registry wiring, `handle_user_input()` |
+| `modules/llm_provider.py` | `LLMProvider` — Mistral (streaming) / Anthropic, NVIDIA reranking |
+| `modules/claude_api.py` | Anthropic Claude client (fallback provider) |
+| `modules/stt.py` | `SpeechToTextModule` — offline Vosk with Whisper fallback |
+| `modules/tts.py` | `TextToSpeechModule` — ElevenLabs → Edge TTS → espeak/piper |
+| `modules/memory.py` | `MemoryManager` — SQLite conversations + FTS5 search |
+| `modules/skill_registry.py` | `SkillRegistry` + `Skill` — intent-based command routing |
+| `modules/calendar_module.py` | Evolution / GNOME Calendar integration |
+| `modules/mail_module.py` | IMAP/SMTP email access |
+| `modules/notes_module.py` | JSON-based note storage |
+| `modules/documents_module.py` | Sandboxed document read/write/edit in `DOCUMENTS_ROOT` |
+| `modules/web_browse.py` | DuckDuckGo search, weather, translation |
+| `modules/system_actions.py` | CPU/memory/disk/process monitoring (psutil) |
 
-### Frontend Components
+### Frontend — `jarvis_frontend/src/`
 
-- **`App.tsx`** — Main application container, WebSocket management
-- **`VoiceOrb.tsx`** — Audio-reactive Three.js particle visualization
-- **`ChatInterface.tsx`** — Message display and text input
-- **`Settings.tsx`** — Configuration panel
+| File | Purpose |
+|------|---------|
+| `App.tsx` | Main app, WebSocket management, recording + playback |
+| `components/VoiceOrb.tsx` | Audio-reactive Three.js particle visualization |
+| `components/Settings.tsx` | Configuration panel |
+| `components/Onboarding.tsx` | First-run setup |
+| `bubble.tsx` | Floating desktop bubble UI (`/bubble.html`) |
+| `main.tsx` | React entry point |
 
-## API Endpoints
+### Desktop — `electron/`
 
-### WebSocket
+`main.js` spawns the FastAPI backend, manages the main window + floating bubble + tray, stores API keys via OS keychain (keytar), and handles auto-updates. `preload.js` exposes a safe IPC bridge (session token, wake word, etc.).
 
-```
-ws://localhost:8000/ws/voice
-```
+## WebSocket Protocol
 
-**Message Format:**
+Connect to `ws://<host>:8000/ws/voice?token=<SESSION_TOKEN>`.
+
+The token is generated at startup (or set via `SESSION_TOKEN` env var). Invalid/missing tokens are closed with code `4001`.
+
+**Client → Server**
 ```json
-{
-  "type": "text",
-  "content": "Your message here"
-}
+{ "type": "text", "content": "What is the weather today?" }
+{ "type": "audio", "audio_base64": "<base64 WAV PCM16 mono 16kHz>" }
 ```
 
-**Response Format:**
+**Server → Client**
 ```json
-{
-  "type": "response",
-  "text": "Claude's response",
-  "audio": "base64_encoded_audio"
-}
+{ "type": "status", "status": "transcribing|processing|generating_speech" }
+{ "type": "partial", "text": "The weather to..." }
+{ "type": "audio_queue", "count": 3 }
+{ "type": "audio_segment_start" }
+{ "type": "audio_chunk", "chunk": "<base64>" }
+{ "type": "audio_segment_end" }
+{ "type": "response", "text": "The weather today is sunny.", "audio": null }
+{ "type": "error", "message": "..." }
 ```
 
-### REST Endpoints
+## REST API Endpoints
 
-- `GET /health` — Server health check
-- `GET /api/calendar/events` — Get upcoming events
-- `GET /api/mail/inbox` — Get recent emails
-- `POST /api/notes` — Create a note
-- `GET /api/memory/{session_id}` — Get conversation history
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/api/system/info` | CPU, memory, disk, processes |
+| `POST` | `/api/system/execute` | Run an allowlisted command (token-protected) |
+| `GET` | `/api/memory/{session_id}` | Conversation history |
+| `POST` | `/api/mail/auth` | Authenticate IMAP/SMTP, returns token |
+| `GET` | `/api/mail/inbox` | Recent emails |
+| `GET` | `/api/mail/unread` | Unread emails |
+| `POST` | `/api/notes` | Create a note |
+| `GET` | `/api/notes` | List notes |
+| `GET` | `/api/calendar/events` | Upcoming events |
+| `POST` | `/api/llm/generate` | Generate text from configured provider |
+| `POST` | `/api/llm/rerank` | Rerank passages (NVIDIA) |
+| `POST` | `/api/stt/transcribe` | Transcribe base64 WAV to text |
+| `GET` | `/api/stt/status` | STT availability |
+| `GET/POST` | `/api/settings/keys` | Read/update masked `.env` keys (e.g. MISTRAL_API_KEY) |
 
-## Performance Tips
+Interactive docs: `http://localhost:8000/docs`.
 
-- **Use Claude Haiku** for 10x faster responses than Sonnet
-- **SQLite FTS5** is faster than vector DBs for memory search (no infrastructure needed)
-- **WebSocket** over HTTP reduces latency significantly for voice
-- **Additive blending** in Three.js transforms the particle orb visuals
+## Docker Deployment
 
-## Troubleshooting
+```bash
+cp jarvis_backend/.env.example .env   # add API keys
+docker-compose up -d
+```
 
-### No Sound Output
-- Check if ElevenLabs API key is set
-- Fallback uses `espeak` on Linux — install with `apt-get install espeak`
-- Check browser audio permissions
-
-### WebSocket Connection Failed
-- Ensure backend is running on `http://localhost:8000`
-- Check if proxy settings in `vite.config.ts` are correct
-- Try accessing `/health` in browser
-
-### Email Not Working
-- For Gmail: Use an App Password (not your regular password)
-- Enable IMAP in Gmail settings
-- Check email credentials in Settings panel
-
-### Microphone Not Working
-- Grant microphone permissions in browser
-- Check if another app is using the microphone
-- Try a different browser
+Access at `http://localhost:8000` (backend serves the built frontend).
 
 ## Development
 
-### Backend Development
+### Backend
 
 ```bash
 cd jarvis_backend
 source venv/bin/activate
-pip install -r requirements.txt
-python main.py  # Runs with auto-reload via Uvicorn
+python main.py        # Uvicorn with auto-reload
+
+# Tests
+venv/bin/python -m pytest jarvis_backend/tests/ -v
+ruff check jarvis_backend/
+black --check jarvis_backend/
 ```
 
-### Frontend Development
+### Frontend
 
 ```bash
 cd jarvis_frontend
-npm run dev  # Runs with hot module replacement
-```
-
-### Database Inspection
-
-```bash
-# Connect to SQLite database
-sqlite3 jarvis_memory.db
-
-# View conversations
-SELECT * FROM conversations LIMIT 10;
-
-# Search full-text
-SELECT * FROM conversations_fts 
-WHERE conversations_fts MATCH 'calendar';
+npx tsc --noEmit
+npx vitest run
+npx eslint . --ext .ts,.tsx
+npx prettier --check "src/**/*.{ts,tsx}"
 ```
 
 ## Extending JARVIS
 
-### Add a New Module
+### Add a New Skill
 
-1. Create a new file in `jarvis_backend/modules/`
-2. Implement your functionality as an async class
-3. Import in `main.py`
-4. Add processing logic in `process_command()`
+1. Create or use a module in `jarvis_backend/modules/`
+2. Register a `Skill` in `routes/state.py`:
+   ```python
+   skill_registry.register(
+       Skill(
+           "weather",
+           ["weather", "forecast", "temperature"],
+           _skill_weather,
+           "Weather lookups",
+       )
+   )
+   ```
+3. The LLM receives the skill output in context and answers naturally.
 
-### Add a New Voice Command
+## Troubleshooting
 
-Edit the `process_command()` function in `main.py`:
+### No Sound Output
+- No ElevenLabs key? Edge TTS is used automatically (no key needed).
+- Final fallback: `apt-get install espeak-ng` (or `piper`).
 
-```python
-async def process_command(user_input: str) -> dict:
-    user_lower = user_input.lower()
-    
-    if "your trigger words" in user_lower:
-        context["your_key"] = await your_module.get_data()
-    
-    return context
-```
+### Voice Input Doesn't Transcribe
+- Install the Vosk model: `bash scripts/download-vosk-model.sh`
+- Or set `OPENAI_API_KEY` for cloud transcription fallback.
+- Check `GET /api/stt/status`.
 
-## Deployment
+### WebSocket Connection Failed
+- Ensure the backend is running on `http://localhost:8000`.
+- In dev, the frontend proxies `/ws` to the backend — check `vite.config.ts`.
+- Verify the session token matches (`SESSION_TOKEN` or generated at startup).
 
-### Production Setup
+### Email Not Working
+- Gmail: enable IMAP and use an App Password (not your regular password).
 
-1. **Update `.env`** with production API keys
-2. **Set `DEBUG=False`** in environment
-3. **Use a reverse proxy** (nginx) in front of FastAPI
-4. **Run behind HTTPS** with valid certificates
-5. **Use managed TTS service** for reliability
+## Documentation
 
-### Example Nginx Config
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name jarvis.example.com;
-    
-    ssl_certificate /path/to/cert;
-    ssl_certificate_key /path/to/key;
-    
-    location / {
-        proxy_pass http://localhost:5173;
-    }
-    
-    location /ws/voice {
-        proxy_pass http://localhost:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-    
-    location /api {
-        proxy_pass http://localhost:8000;
-    }
-}
-```
-
-## Contributing
-
-Contributions welcome! Areas for improvement:
-
-- Additional calendar integrations (Outlook, Caldav)
-- Real-time transcription improvements
-- Multi-language support
-- Custom wake words
-- Integration with more email providers
-- Desktop app (Electron/Tauri)
+- `QUICKSTART.md` — setup guide
+- `ARCHITECTURE.md` — detailed code overview
+- `WS_PROTOCOL.md` — full WebSocket protocol
+- `DEPLOYMENT.md` — deployment & release process
+- `FILE_MANIFEST.md` — file-by-file breakdown
 
 ## License
 
-MIT License — See LICENSE file for details
-
-## Support
-
-- Issues: GitHub Issues
-- Documentation: Full API docs at `/docs` (FastAPI Swagger)
-- Community: Discord server (coming soon)
+MIT License — See LICENSE file for details.
 
 ## Credits
 
 Built with:
-- [Claude API](https://anthropic.com) — LLM backbone
 - [FastAPI](https://fastapi.tiangolo.com) — Web framework
 - [React](https://react.dev) — UI framework
 - [Three.js](https://threejs.org) — 3D visualization
+- [Electron](https://www.electronjs.org) — desktop shell
+- [Vosk](https://alphacephei.com/vosk/) — offline speech recognition
+- [Mistral AI](https://mistral.ai) — LLM
+- [Anthropic](https://anthropic.com) — LLM fallback
 - [ElevenLabs](https://elevenlabs.io) — Text-to-speech
-
----
-
-Made with ❤️ for hands-free productivity

@@ -32,13 +32,10 @@ const VoiceOrb: React.FC<VoiceOrbProps> = ({ state, analysers }) => {
       75,
       containerRef.current.clientWidth / containerRef.current.clientHeight,
       0.1,
-      1000
+      1000,
     );
 
-    renderer.setSize(
-      containerRef.current.clientWidth,
-      containerRef.current.clientHeight
-    );
+    renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
     renderer.setClearColor(0x000000, 0);
     containerRef.current.appendChild(renderer.domElement);
 
@@ -71,7 +68,7 @@ const VoiceOrb: React.FC<VoiceOrbProps> = ({ state, analysers }) => {
       size: 0.02,
       sizeAttenuation: true,
       transparent: true,
-      opacity: 0.8
+      opacity: 0.8,
     });
 
     const particles = new THREE.Points(geometry, material);
@@ -82,7 +79,7 @@ const VoiceOrb: React.FC<VoiceOrbProps> = ({ state, analysers }) => {
     light.position.set(5, 5, 5);
     scene.add(light);
 
-    let dataArray = new Uint8Array(256);
+    const dataArray = new Uint8Array(256);
 
     const animate = () => {
       animationIdRef.current = requestAnimationFrame(animate);
@@ -110,7 +107,7 @@ const VoiceOrb: React.FC<VoiceOrbProps> = ({ state, analysers }) => {
         let y = positionArray[i + 1];
         let z = positionArray[i + 2];
 
-        let distance = Math.sqrt(x * x + y * y + z * z);
+        const distance = Math.sqrt(x * x + y * y + z * z);
         const targetDistance = 1 + average * 0.5;
 
         if (distance > 0) {
@@ -186,8 +183,14 @@ const VoiceOrb: React.FC<VoiceOrbProps> = ({ state, analysers }) => {
   }, []);
 
   return (
-    <div className="orb-base" style={{ width: '100%', height: '100%' }}>
-      <div className="orb-fallback" />
+    <div
+      className="orb-base"
+      style={{ width: '100%', height: '100%' }}
+      role="img"
+      aria-label={`JARVIS orb, state: ${state}`}
+      aria-hidden={false}
+    >
+      <div className="orb-fallback" aria-hidden="true" />
     </div>
   );
 };

@@ -1,10 +1,26 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, session, Tray, nativeImage, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const http = require('http');
 const { autoUpdater } = require('electron-updater');
+
+let keytar;
+try {
+  keytar = require('keytar');
+} catch (e) {
+  console.warn('[JARVIS] keytar not available; falling back to .env for API keys');
+}
+
+const KEYCHAIN_SERVICE = 'jarvis-api-keys';
+const MANAGED_KEY_NAMES = [
+  'MISTRAL_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'ELEVENLABS_API_KEY',
+  'NVIDIA_API_KEY',
+];
 
 const isDev = !app.isPackaged;
 const BACKEND_HOST = '127.0.0.1';
@@ -13,8 +29,6 @@ if (process.platform !== 'darwin') {
   app.disableHardwareAcceleration();
 }
 app.commandLine.appendSwitch('no-sandbox', 'true');
-app.commandLine.appendSwitch('disable-gpu', 'true');
-app.commandLine.appendSwitch('disable-gpu-compositing', 'true');
 
 function getBackendPort() {
   const envPort = process.env.JARVIS_BACKEND_PORT;
@@ -47,6 +61,23 @@ const BACKEND_PORT = getBackendPort();
 const HEALTH_CHECK_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}/health`;
 const STARTUP_TIMEOUT_MS = 120000;
 const POLL_INTERVAL_MS = 500;
+
+// The Markdown vault folder that the backend reads/writes. Mirrors the
+// backend's own resolution so the IPC "open vault" action opens the same dir.
+function getVaultPath() {
+  if (!isDev) {
+    return path.join(app.getPath('userData'), 'JARVIS Memory');
+  }
+  const envPath = path.join(getBackendDir(), '.env');
+  try {
+    const content = fs.readFileSync(envPath, 'utf8');
+    const match = content.match(/^MEMORY_VAULT_PATH\s*=\s*(.+)$/m);
+    if (match) return match[1].trim();
+  } catch (e) {
+    // .env not found, use default
+  }
+  return path.join(os.homedir(), 'Documents', 'JARVIS Memory');
+}
 
 let mainWindow = null;
 let bubbleWindow = null;
@@ -272,7 +303,7 @@ function createWindow() {
   });
 }
 
-function startBackend() {
+async function startBackend() {
   const pythonPath = getVenvPython();
   const mainPy = getMainPyPath();
   const backendDir = getBackendDir();
@@ -284,9 +315,21 @@ function startBackend() {
   env.SERVER_PORT = String(BACKEND_PORT);
 
   if (!isDev) {
+    // Retrieve API keys from OS keychain and inject into backend env
+    if (keytar) {
+      for (const keyName of MANAGED_KEY_NAMES) {
+        const storedValue = await keytar.getPassword(KEYCHAIN_SERVICE, keyName);
+        if (storedValue) {
+          env[keyName] = storedValue;
+          log(`Injected ${keyName} from OS keychain`);
+        }
+      }
+    }
+
     const userData = app.getPath('userData');
     env.DATABASE_PATH = path.join(userData, 'jarvis_memory.db');
     env.ENV_PATH = path.join(userData, '.env');
+    env.MEMORY_VAULT_PATH = getVaultPath();
 
     const tokenDir = path.join(userData, 'secrets');
     env.SESSION_TOKEN_PATH = path.join(tokenDir, 'session.token');
@@ -412,6 +455,12 @@ function createBubbleWindow() {
   });
 }
 
+function notifyBubbleOfMainWindowVisibility(visible) {
+  if (bubbleWindow && bubbleWindow.webContents && !bubbleWindow.webContents.isDestroyed()) {
+    bubbleWindow.webContents.send('main-window-visibility', visible);
+  }
+}
+
 function showMainWindow(nearBubble = false) {
   if (!mainWindow) {
     createWindow();
@@ -437,6 +486,7 @@ function showMainWindow(nearBubble = false) {
 
   mainWindow.show();
   mainWindow.focus();
+  notifyBubbleOfMainWindowVisibility(true);
 }
 
 function showMainWindowFromWakeWord(nearBubble = false) {
@@ -449,6 +499,7 @@ function showMainWindowFromWakeWord(nearBubble = false) {
 function hideMainWindow() {
   if (mainWindow) {
     mainWindow.hide();
+    notifyBubbleOfMainWindowVisibility(false);
   }
 }
 
@@ -527,7 +578,64 @@ async function init() {
   createBubbleWindow();
   createTray();
 
-  if (!isDev) {
+autoUpdater.on('checking-for-update', () => {
+  log('Checking for updates...');
+});
+
+autoUpdater.on('update-available', (info) => {
+  log(`Update available: v${info.version}`);
+  if (mainWindow) {
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Update Available',
+      message: `A new version of JARVIS (v${info.version}) is available.`,
+      detail: 'The update will be downloaded in the background. It will be installed when you restart the app.',
+      buttons: ['OK', 'Install Now'],
+      cancelId: 0,
+    }).then((result) => {
+      if (result.response === 1) {
+        autoUpdater.quitAndInstall();
+      }
+    });
+  } else {
+    autoUpdater.downloadUpdate();
+  }
+});
+
+autoUpdater.on('update-not-available', () => {
+  log('No updates available');
+});
+
+autoUpdater.on('error', (err) => {
+  log(`Update error: ${err == null ? 'unknown' : err.message}`);
+  if (mainWindow) {
+    dialog.showErrorBox(
+      'Update Error',
+      `Failed to check for updates: ${err == null ? 'unknown error' : err.message}`
+    );
+  }
+});
+
+autoUpdater.on('update-downloaded', (info) => {
+  log(`Update downloaded: v${info.version}`);
+  const response = dialog.showMessageBoxSync({
+    type: 'info',
+    title: 'Update Ready',
+    message: `JARVIS v${info.version} has been downloaded.`,
+    detail: 'Restart now to install the update.',
+    buttons: ['Restart Now', 'Later'],
+    cancelId: 1,
+  });
+  if (response === 0) {
+    autoUpdater.quitAndInstall();
+  }
+});
+
+autoUpdater.on('download-progress', (progressObj) => {
+  log(`Download progress: ${Math.round(progressObj.percent)}%`);
+});
+
+if (!isDev) {
     const shortcut = process.env.GLOBAL_SHORTCUT || 'CommandOrControl+Shift+J';
     globalShortcut.register(shortcut, () => {
       toggleMainWindow();
@@ -562,6 +670,49 @@ ipcMain.handle('notify-wake-word-detected', () => {
   showMainWindowFromWakeWord(true);
 });
 ipcMain.handle('get-session-token', () => sessionToken);
+
+ipcMain.handle('get-vault-path', () => getVaultPath());
+ipcMain.handle('open-vault', async () => {
+  const vaultPath = getVaultPath();
+  try {
+    await shell.openPath(vaultPath);
+    return { ok: true, path: vaultPath };
+  } catch (err) {
+    log(`Could not open vault folder: ${err.message}`);
+    return { ok: false, path: vaultPath, error: err.message };
+  }
+});
+
+ipcMain.handle('store-api-key', async (_event, keyName, value) => {
+  if (!keytar) return { success: false, error: 'keytar unavailable' };
+  if (keytar && MANAGED_KEY_NAMES.includes(keyName)) {
+    await keytar.setPassword(KEYCHAIN_SERVICE, keyName, value);
+    log(`API key ${keyName} stored in OS keychain`);
+    return { success: true };
+  }
+  return { success: false, error: `Unknown key: ${keyName}` };
+});
+
+ipcMain.handle('retrieve-api-key', async (_event, keyName) => {
+  if (!keytar) return null;
+  return await keytar.getPassword(KEYCHAIN_SERVICE, keyName);
+});
+
+ipcMain.handle('retrieve-api-keys', async () => {
+  if (!keytar) return {};
+  const result = {};
+  for (const name of MANAGED_KEY_NAMES) {
+    const val = await keytar.getPassword(KEYCHAIN_SERVICE, name);
+    if (val) result[name] = val;
+  }
+  return result;
+});
+
+ipcMain.handle('delete-api-key', async (_event, keyName) => {
+  if (!keytar) return { success: false, error: 'keytar unavailable' };
+  await keytar.deletePassword(KEYCHAIN_SERVICE, keyName);
+  return { success: true };
+});
 
 app.whenReady().then(init);
 

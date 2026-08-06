@@ -1,7 +1,36 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
 import './App.css';
 import VoiceOrb from './components/VoiceOrb';
-import Settings from './components/Settings';
+import Onboarding from './components/Onboarding';
+
+const Settings = lazy(() => import('./components/Settings'));
+const MemoryPage = lazy(() => import('./components/MemoryPage'));
+
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="error-banner" style={{ padding: '2rem', textAlign: 'center' }}>
+          <p>Something went wrong: {this.state.error?.message}</p>
+          <button onClick={() => window.location.reload()}>Restart</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking';
 type SheetState = 'hidden' | 'transcript' | 'response';
@@ -28,6 +57,10 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [orbState, setOrbState] = useState<OrbState>('idle');
   const [showSettings, setShowSettings] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => {
+    return localStorage.getItem('jarvisOnboarded') !== 'true';
+  });
   const [sheetState, setSheetState] = useState<SheetState>('hidden');
   const [liveTranscript, setLiveTranscript] = useState('');
   const [assistantText, setAssistantText] = useState('');
@@ -39,12 +72,12 @@ function App() {
     theme: 'dark',
     enableNotifications: true,
     serverUrl: localStorage.getItem('serverUrl') || 'localhost:8000',
-    enableWakeWord: true
+    enableWakeWord: true,
   }));
   const [emailConfig, setEmailConfig] = useState<EmailConfig>(() => ({
     email: localStorage.getItem('emailAddress') || '',
     appPassword: '',
-    sessionToken: localStorage.getItem('emailSessionToken') || null
+    sessionToken: localStorage.getItem('emailSessionToken') || null,
   }));
 
   const ws = useRef<WebSocket | null>(null);
@@ -62,6 +95,8 @@ function App() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const recordingTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const micPermissionGrantedRef = useRef(false);
+  const micBusyRef = useRef(false);
 
   const blobToWavBase64 = async (blob: Blob): Promise<string> => {
     const arrayBuffer = await blob.arrayBuffer();
@@ -113,18 +148,33 @@ function App() {
     return btoa(binary);
   };
 
-  const resolveWebSocketUrl = (server: string) => {
+  const getSessionToken = async (): Promise<string | null> => {
+    const api = (window as any).electronAPI;
+    if (!api?.getSessionToken) return null;
+    try {
+      return (await api.getSessionToken()) as string | null;
+    } catch (err) {
+      console.error('Failed to get session token', err);
+      return null;
+    }
+  };
+
+  const resolveWebSocketUrl = (server: string, token: string | null) => {
     const trimmed = server.replace(/\/*$/, '');
+    let url: string;
     if (trimmed.startsWith('ws://') || trimmed.startsWith('wss://')) {
-      return `${trimmed}/ws/voice`;
+      url = `${trimmed}/ws/voice`;
+    } else if (trimmed.startsWith('http://')) {
+      url = `ws://${trimmed.slice(7)}/ws/voice`;
+    } else if (trimmed.startsWith('https://')) {
+      url = `wss://${trimmed.slice(8)}/ws/voice`;
+    } else {
+      url = `ws://${trimmed}/ws/voice`;
     }
-    if (trimmed.startsWith('http://')) {
-      return `ws://${trimmed.slice(7)}/ws/voice`;
+    if (token) {
+      url += `?token=${encodeURIComponent(token)}`;
     }
-    if (trimmed.startsWith('https://')) {
-      return `wss://${trimmed.slice(8)}/ws/voice`;
-    }
-    return `ws://${trimmed}/ws/voice`;
+    return url;
   };
 
   const resetCollapseTimer = useCallback(() => {
@@ -149,12 +199,55 @@ function App() {
     return () => clearInterval(timer);
   }, [sheetState, tryCollapseSheet]);
 
+  const withTimeout = <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+
+  const tryGetUserMedia = async (constraints: MediaStreamConstraints): Promise<MediaStream> => {
+    try {
+      return await withTimeout(
+        navigator.mediaDevices.getUserMedia(constraints),
+        6000,
+        'Microphone timed out opening the audio device',
+      );
+    } catch (err) {
+      const name = (err as any)?.name || '';
+      const message = (err as Error)?.message || '';
+      const processingFailed =
+        name === 'OverconstrainedError' || name === 'TimeoutError' || message.includes('timed out');
+      if (processingFailed && typeof constraints.audio === 'object') {
+        console.warn('Mic open failed with processing constraints, retrying plain audio', err);
+        return withTimeout(
+          navigator.mediaDevices.getUserMedia({ audio: true }),
+          6000,
+          'Microphone timed out opening the audio device',
+        );
+      }
+      throw err;
+    }
+  };
+
   const ensureMicPermission = useCallback(async (): Promise<boolean> => {
+    if (micPermissionGrantedRef.current) {
+      return true;
+    }
     try {
       if (navigator.permissions && (navigator.permissions as any).query) {
         try {
           const result = await (navigator.permissions as any).query({ name: 'microphone' });
           if (result.state === 'granted') {
+            micPermissionGrantedRef.current = true;
             return true;
           }
           // 'prompt' or 'denied' → still try a real capture probe below; the OS
@@ -163,31 +256,44 @@ function App() {
           console.warn('Permissions API query failed', permErr);
         }
       }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await tryGetUserMedia({ audio: true });
       stream.getTracks().forEach((track) => track.stop());
+      micPermissionGrantedRef.current = true;
       return true;
     } catch (err) {
-      setError('Microphone access denied. Check that a microphone is connected and JARVIS is allowed to use it.');
+      console.error('Microphone permission check failed', err);
+      setError(
+        'Microphone access denied or unavailable. Check that a microphone is connected and JARVIS is allowed to use it.',
+      );
       return false;
     }
   }, []);
 
   useEffect(() => {
-    const connect = () => {
+    let reconnectDelay = 1000;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = async () => {
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         return;
+      }
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
       if (ws.current) {
         ws.current.close();
         ws.current = null;
       }
       try {
-        const url = resolveWebSocketUrl(settings.serverUrl);
+        const token = await getSessionToken();
+        const url = resolveWebSocketUrl(settings.serverUrl, token);
         ws.current = new WebSocket(url);
 
         ws.current.onopen = () => {
           isConnectedRef.current = true;
           setError(null);
+          reconnectDelay = 1000;
         };
 
         ws.current.onmessage = (event) => {
@@ -252,12 +358,29 @@ function App() {
         };
 
         ws.current.onerror = () => {
+          console.error('WebSocket error');
           setError('Connection error');
           isConnectedRef.current = false;
+          setIsProcessing(false);
+          processingRef.current = false;
         };
 
         ws.current.onclose = () => {
           isConnectedRef.current = false;
+          // If the socket dies while a request is in flight, do not leave the
+          // UI stuck in "processing" (silently blocking future taps).
+          setIsProcessing(false);
+          processingRef.current = false;
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+          }
+          reconnectTimer = setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+            const jitter = Math.random() * 0.3 + 0.85;
+            const nextDelay = Math.min(Math.floor(reconnectDelay * jitter), 60000);
+            reconnectDelay = nextDelay;
+            connect();
+          }, reconnectDelay);
         };
       } catch (err) {
         setError('Failed to connect to server');
@@ -267,12 +390,23 @@ function App() {
     connect();
 
     const interval = setInterval(() => {
-      if (!isConnectedRef.current) {
-        connect();
+      if (!isConnectedRef.current && !reconnectTimer) {
+        reconnectTimer = setTimeout(() => {
+          reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+          connect();
+        }, reconnectDelay);
       }
     }, 5000);
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      if (ws.current) {
+        ws.current.close();
+      }
+    };
   }, [settings.serverUrl, resetCollapseTimer]);
 
   useEffect(() => {
@@ -286,6 +420,31 @@ function App() {
     initAudio();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        clearTimeout(recordingTimerRef.current);
+      }
+      if (processingTimerRef.current) {
+        clearTimeout(processingTimerRef.current);
+      }
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        try {
+          recorder.stop();
+        } catch (err) {
+          console.warn('Failed to stop recorder on unmount', err);
+        }
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track: MediaStreamTrack) => track.stop());
+      }
+      if (audioContext.current && audioContext.current.state !== 'closed') {
+        audioContext.current.close().catch(() => {});
+      }
+    };
+  }, []);
+
   const listeningRef = useRef(isListening);
   const processingRef = useRef(isProcessing);
 
@@ -296,22 +455,8 @@ function App() {
     if (listeningRef.current || processingRef.current) {
       return;
     }
-
-    const hasPermission = await ensureMicPermission();
-    if (!hasPermission) {
-      return;
-    }
-
-    if (navigator.vibrate) {
-      navigator.vibrate(50);
-    }
-
-    setOrbState('listening');
-    setSheetState('transcript');
-    setLiveTranscript('Listening...');
-    resetCollapseTimer();
-    startRecording();
-  }, [ensureMicPermission, resetCollapseTimer]);
+    await beginVoiceSession();
+  }, []);
 
   useEffect(() => {
     const api = (window as any).electronAPI;
@@ -332,7 +477,7 @@ function App() {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const stream = await tryGetUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -371,7 +516,10 @@ function App() {
         }
       }, 30000);
     } catch (err) {
-      setError('Microphone access denied. Check that a microphone is connected and JARVIS has permission to use it.');
+      console.error('Failed to start microphone recording', err);
+      setError(
+        'Could not start the microphone. Check that a microphone is connected and JARVIS has permission to use it.',
+      );
       setOrbState('idle');
       setIsListening(false);
       listeningRef.current = false;
@@ -406,6 +554,8 @@ function App() {
       recorder = new MediaRecorder(stream);
     } catch (recErr) {
       cleanupListening(stream);
+      setIsListening(false);
+      listeningRef.current = false;
       setError('MediaRecorder is not supported in this browser');
       setOrbState('idle');
       setSheetState('hidden');
@@ -419,6 +569,10 @@ function App() {
     };
     recorder.onerror = () => {
       cleanupListening(stream);
+      setIsListening(false);
+      listeningRef.current = false;
+      setOrbState('idle');
+      setSheetState('hidden');
       setError('Recording failed. Please try again.');
     };
     recorder.start();
@@ -428,7 +582,14 @@ function App() {
   const stopManualRecording = async () => {
     const recorder = mediaRecorderRef.current;
     const stream = streamRef.current;
-    if (!recorder) return;
+    if (!recorder) {
+      cleanupListening(stream);
+      setIsListening(false);
+      listeningRef.current = false;
+      setOrbState('idle');
+      setSheetState('hidden');
+      return;
+    }
 
     setIsListening(false);
     listeningRef.current = false;
@@ -457,12 +618,18 @@ function App() {
         }
         setIsProcessing(true);
         processingRef.current = true;
-        ws.current.send(JSON.stringify({
-          type: 'audio',
-          audio_base64: wavBase64,
-        }));
+        startProcessingWatchdog();
+        ws.current.send(
+          JSON.stringify({
+            type: 'audio',
+            audio_base64: wavBase64,
+          }),
+        );
       } catch (err) {
+        console.error('Failed to transcribe audio', err);
         setError('Failed to transcribe audio');
+        setIsProcessing(false);
+        processingRef.current = false;
         setOrbState('idle');
         setSheetState('hidden');
       }
@@ -471,54 +638,73 @@ function App() {
     try {
       recorder.stop();
     } catch (err) {
+      console.error('Failed to stop recorder', err);
       cleanupListening(stream);
       setOrbState('idle');
     }
   };
 
-  const toggleTalk = useCallback(async () => {
-    if (isProcessing) return;
+  const beginVoiceSession = async () => {
+    if (processingRef.current || listeningRef.current || micBusyRef.current) {
+      return;
+    }
+    micBusyRef.current = true;
+    try {
+      const hasPermission = await ensureMicPermission();
+      if (!hasPermission) return;
+      if (navigator.vibrate) {
+        navigator.vibrate(50);
+      }
+      setSheetState('transcript');
+      resetCollapseTimer();
+      await startRecording();
+    } finally {
+      micBusyRef.current = false;
+    }
+  };
 
-    if (isListening) {
-      // Second tap while recording stops and sends the audio.
+  const toggleTalk = useCallback(async () => {
+    if (processingRef.current) return;
+    if (listeningRef.current) {
       await stopManualRecording();
       return;
     }
-
-    const hasPermission = await ensureMicPermission();
-    if (!hasPermission) return;
-
-    if (navigator.vibrate) {
-      navigator.vibrate(50);
-    }
-    setSheetState('transcript');
-    resetCollapseTimer();
-    startRecording();
-  }, [isProcessing, isListening, stopManualRecording, ensureMicPermission, resetCollapseTimer]);
+    await beginVoiceSession();
+  }, [stopManualRecording]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.repeat) return;
       if (e.code === 'Space' || e.key === ' ') {
-        e.preventDefault();
-        if (isProcessing) return;
-        if (isListening) {
-          stopManualRecording();
-        } else {
-          ensureMicPermission().then((hasPermission) => {
-            if (hasPermission) {
-              if (navigator.vibrate) navigator.vibrate(50);
-              setSheetState('transcript');
-              resetCollapseTimer();
-              startRecording();
-            }
-          });
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+        ) {
+          return;
         }
+        e.preventDefault();
+        toggleTalk();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isProcessing, isListening, ensureMicPermission, resetCollapseTimer, startRecording, stopManualRecording]);
+  }, [toggleTalk]);
+
+  const startProcessingWatchdog = () => {
+    if (processingTimerRef.current) {
+      clearTimeout(processingTimerRef.current);
+    }
+    processingTimerRef.current = setTimeout(() => {
+      if (processingRef.current) {
+        console.error('Processing watchdog fired: no reply within 45s');
+        setIsProcessing(false);
+        processingRef.current = false;
+        setOrbState('idle');
+        setError('The assistant took too long to respond. Please try again.');
+      }
+    }, 45000);
+  };
 
   const sendMessage = async (content: string) => {
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
@@ -532,24 +718,16 @@ function App() {
       processingRef.current = true;
       setOrbState('thinking');
       resetCollapseTimer();
+      startProcessingWatchdog();
 
-      if (processingTimerRef.current) {
-        clearTimeout(processingTimerRef.current);
-      }
-      processingTimerRef.current = setTimeout(() => {
-        if (processingRef.current) {
-          setIsProcessing(false);
-          processingRef.current = false;
-          setOrbState('idle');
-          setError('The assistant took too long to respond. Please try again.');
-        }
-      }, 45000);
-
-      ws.current.send(JSON.stringify({
-        type: 'text',
-        content
-      }));
+      ws.current.send(
+        JSON.stringify({
+          type: 'text',
+          content,
+        }),
+      );
     } catch (err) {
+      console.error('Failed to send message', err);
       setError('Failed to send message');
       setIsProcessing(false);
       processingRef.current = false;
@@ -567,7 +745,7 @@ function App() {
     }
     isPlayingAudioRef.current = true;
     try {
-      const audioData = Uint8Array.from(atob(next), c => c.charCodeAt(0));
+      const audioData = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
       const isWav =
         audioData.byteLength > 4 &&
         String.fromCharCode(audioData[0], audioData[1], audioData[2], audioData[3]) === 'RIFF';
@@ -599,10 +777,13 @@ function App() {
     }
   }, [settings.volume, settings.speed]);
 
-  const enqueueAudio = useCallback((audioBase64: string) => {
-    audioQueueRef.current.push(audioBase64);
-    playNextAudio();
-  }, [playNextAudio]);
+  const enqueueAudio = useCallback(
+    (audioBase64: string) => {
+      audioQueueRef.current.push(audioBase64);
+      playNextAudio();
+    },
+    [playNextAudio],
+  );
 
   enqueueAudioRef.current = enqueueAudio;
 
@@ -614,6 +795,11 @@ function App() {
     localStorage.setItem('serverUrl', updatedSettings.serverUrl);
     localStorage.setItem('emailAddress', updatedEmailConfig.email);
 
+    if (showOnboarding) {
+      localStorage.setItem('jarvisOnboarded', 'true');
+      setShowOnboarding(false);
+    }
+
     if (updatedEmailConfig.email && updatedEmailConfig.appPassword && updatedSettings.serverUrl) {
       const apiUrl = updatedSettings.serverUrl.trim();
       const baseUrl = apiUrl.startsWith('http') ? apiUrl : `http://${apiUrl}`;
@@ -622,108 +808,180 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: updatedEmailConfig.email,
-          password: updatedEmailConfig.appPassword
+          password: updatedEmailConfig.appPassword,
+        }),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            console.warn('Mail auth request failed:', res.status, res.statusText);
+            return;
+          }
+          return res.json();
         })
-      }).then((res) => {
-        if (!res.ok) {
-          console.warn('Mail auth request failed:', res.status, res.statusText);
-          return;
-        }
-        return res.json();
-      }).then((data) => {
-        if (data && data.token) {
-          localStorage.setItem('emailSessionToken', data.token);
-          setEmailConfig(prev => ({ ...prev, sessionToken: data.token, appPassword: '' }));
-        }
-      }).catch((error) => {
-        console.warn('Mail auth request failed', error);
-      });
+        .then((data) => {
+          if (data && data.token) {
+            localStorage.setItem('emailSessionToken', data.token);
+            setEmailConfig((prev) => ({ ...prev, sessionToken: data.token, appPassword: '' }));
+          }
+        })
+        .catch((error) => {
+          console.warn('Mail auth request failed', error);
+        });
     }
   };
 
   return (
-    <div className="app">
-      <main className="app-main">
-        <div
-          className={`orb-container ${isListening ? 'recording' : ''}`}
-          onClick={toggleTalk}
-          role="button"
-          aria-label={isListening ? 'Stop recording' : 'Talk to JARVIS'}
-          title={isListening ? 'Tap to stop and send' : 'Tap to talk'}
-        >
-          <VoiceOrb
-            state={orbState}
-            analysers={analysers.current}
+    <ErrorBoundary>
+      <div className="app" role="main" aria-label="JARVIS Voice Assistant">
+        {showOnboarding && (
+          <Onboarding
+            settings={settings}
+            emailConfig={emailConfig}
+            onSave={(newSettings, newEmail) => {
+              handleSaveSettings(newSettings, newEmail);
+            }}
+            onSkip={() => {
+              localStorage.setItem('jarvisOnboarded', 'true');
+              setShowOnboarding(false);
+            }}
           />
-          <div className="orb-hint">
-            {isProcessing ? 'Thinking...' : isListening ? (mediaRecorderRef.current ? 'Tap to stop' : 'Listening...') : 'Tap to talk'}
+        )}
+        <main className="app-main">
+          <div
+            className={`orb-container ${isListening ? 'recording' : ''}`}
+            onClick={toggleTalk}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                toggleTalk();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+            aria-label={isListening ? 'Stop recording' : 'Talk to JARVIS'}
+            aria-pressed={isListening}
+            title={isListening ? 'Tap to stop and send' : 'Tap to talk'}
+          >
+            <VoiceOrb state={orbState} analysers={analysers.current} />
+            <div className="orb-hint">
+              {isProcessing
+                ? 'Thinking...'
+                : isListening
+                  ? mediaRecorderRef.current
+                    ? 'Tap to stop'
+                    : 'Listening...'
+                  : 'Tap to talk'}
+            </div>
           </div>
-        </div>
 
-        <button
-          className="settings-btn"
-          onClick={() => setShowSettings(!showSettings)}
-          title="Settings"
-        >
-          ⚙️
-        </button>
+          <button
+            className="settings-btn"
+            onClick={() => setShowSettings(!showSettings)}
+            title="Settings"
+            aria-label="Open settings"
+          >
+            ⚙️
+          </button>
 
-        <div className={`bottom-sheet ${sheetState !== 'hidden' ? 'open' : ''}`}>
-          <div className="sheet-handle" />
-          <div className="sheet-content">
-            {sheetState === 'transcript' && (
-              <div className="sheet-transcript">
-                <p>{liveTranscript}</p>
-              </div>
-            )}
-            {assistantText && (
-              <div className="sheet-response">
-                <p>{assistantText}</p>
-              </div>
-            )}
+          <button
+            className="settings-btn"
+            onClick={() => setShowMemory(true)}
+            title="Memory Vault"
+            aria-label="Open memory vault"
+          >
+            📚
+          </button>
+
+          <div
+            className={`bottom-sheet ${sheetState !== 'hidden' ? 'open' : ''}`}
+            aria-hidden={sheetState === 'hidden'}
+            role="region"
+            aria-label="Conversation panel"
+          >
+            <div className="sheet-handle" aria-hidden="true" />
+            <div className="sheet-content">
+              {sheetState === 'transcript' && (
+                <div className="sheet-transcript" aria-live="polite">
+                  <p>{liveTranscript}</p>
+                </div>
+              )}
+              {assistantText && (
+                <div className="sheet-response" aria-live="polite">
+                  <p>{assistantText}</p>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
 
-        <form
-          className="text-input-bar"
-          onSubmit={(e) => {
-            e.preventDefault();
-            const text = textInput.trim();
-            if (!text) return;
-            setLiveTranscript(text);
-            setSheetState('transcript');
-            resetCollapseTimer();
-            sendMessage(text);
-            setTextInput('');
-          }}
-        >
-          <input
-            type="text"
-            value={textInput}
-            onChange={(e) => setTextInput(e.target.value)}
-            placeholder="Type a message (or tap the orb to talk)..."
-            aria-label="Type a message"
-          />
-          <button type="submit" title="Send">➤</button>
-        </form>
-      </main>
+          <form
+            className="text-input-bar"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const text = textInput.trim();
+              if (!text) return;
+              setLiveTranscript(text);
+              setSheetState('transcript');
+              resetCollapseTimer();
+              sendMessage(text);
+              setTextInput('');
+            }}
+          >
+            <label htmlFor="text-input" className="sr-only">
+              Type a message
+            </label>
+            <input
+              id="text-input"
+              type="text"
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value)}
+              placeholder="Type a message (or tap the orb to talk)..."
+              aria-label="Type a message"
+              aria-describedby="input-help"
+            />
+            <button type="submit" title="Send" aria-label="Send message">
+              ➤
+            </button>
+            <span id="input-help" className="sr-only">
+              Press Enter to send
+            </span>
+          </form>
+        </main>
 
-      {error && (
-        <div className="error-banner">
-          <p>{error}</p>
-          <button onClick={() => setError(null)}>✕</button>
-        </div>
-      )}
+        {error && (
+          <div className="error-banner" role="alert" aria-live="assertive">
+            <p>{error}</p>
+            <button onClick={() => setError(null)} aria-label="Dismiss error">
+              ✕
+            </button>
+          </div>
+        )}
 
-      {showSettings && (
-        <Settings
-          onClose={() => setShowSettings(false)}
-          settings={settings}
-          emailConfig={emailConfig}
-          onSave={handleSaveSettings}
-        />
-      )}
-    </div>
+        {showSettings && (
+          <Suspense
+            fallback={
+              <div className="settings-overlay" aria-label="Loading settings">
+                <div className="settings-panel">
+                  <div className="settings-content">Loading…</div>
+                </div>
+              </div>
+            }
+          >
+            <Settings
+              onClose={() => setShowSettings(false)}
+              settings={settings}
+              emailConfig={emailConfig}
+              onSave={handleSaveSettings}
+            />
+          </Suspense>
+        )}
+
+        {showMemory && (
+          <Suspense fallback={<div className="memory-overlay">Loading memory vault…</div>}>
+            <MemoryPage onClose={() => setShowMemory(false)} />
+          </Suspense>
+        )}
+      </div>
+    </ErrorBoundary>
   );
 }
 
