@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import queue
 import threading
 import wave
 
@@ -116,3 +117,96 @@ class SpeechToTextModule:
     @property
     def has_cloud_fallback(self) -> bool:
         return bool(self.openai_api_key)
+
+    def preload(self) -> bool:
+        """Load the Vosk model in the background so the first utterance is fast."""
+        return self._ensure_loaded()
+
+    def stream(self, sample_rate: int = 16000) -> "_StreamingRecognizer":
+        """Create a streaming recognizer for an in-progress utterance."""
+        return _StreamingRecognizer(self, sample_rate)
+
+
+def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap raw PCM16 mono samples into a WAV container."""
+    with io.BytesIO() as buf:
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm)
+        return buf.getvalue()
+
+
+class _StreamingRecognizer:
+    """Incremental Vosk transcription fed by PCM16 chunks.
+
+    PCM chunks are pushed to a worker thread as they arrive over the WebSocket;
+    ``AcceptWaveform`` is called per chunk so the recognizer is always up to
+    date. ``finish()`` returns the final transcription. When Vosk is unavailable
+    or returns no text, the cloud fallback is used with the accumulated WAV.
+    """
+
+    def __init__(self, stt_module: "SpeechToTextModule", sample_rate: int):
+        self._stt = stt_module
+        self._sample_rate = sample_rate
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._done = threading.Event()
+        self._result = ""
+        self._error: Exception | None = None
+        self._pcm_all = bytearray()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            vosk_used = False
+            if self._stt._ensure_loaded():
+                vosk_used = True
+                recognizer = KaldiRecognizer(self._stt._model, self._sample_rate)
+                while True:
+                    chunk = self._queue.get()
+                    if chunk is None:
+                        break
+                    self._pcm_all.extend(chunk)
+                    recognizer.AcceptWaveform(chunk)
+                result = json.loads(recognizer.FinalResult())
+                text = (result.get("text") or "").strip()
+                if text:
+                    self._result = text
+                    self._done.set()
+                    return
+            else:
+                while True:
+                    chunk = self._queue.get()
+                    if chunk is None:
+                        break
+                    self._pcm_all.extend(chunk)
+
+            wav = _pcm16_to_wav(bytes(self._pcm_all), self._sample_rate)
+            if vosk_used and not self._stt.has_cloud_fallback:
+                # Vosk heard nothing and there is no cloud fallback to try.
+                self._result = ""
+            else:
+                self._result = self._stt._transcribe_cloud(wav)
+        except Exception as e:
+            self._error = e
+        finally:
+            self._done.set()
+
+    def feed(self, pcm: bytes) -> None:
+        """Push a PCM16 chunk to the recognizer worker (non-blocking)."""
+        self._queue.put(pcm)
+
+    def abandon(self) -> None:
+        """Discard an unfinished utterance without waiting for the result."""
+        self._queue.put(None)
+
+    def finish(self, timeout: float = 15.0) -> str:
+        """Finalize the utterance and return the transcription."""
+        self._queue.put(None)
+        if not self._done.wait(timeout):
+            raise RuntimeError("Speech recognition timed out")
+        if self._error is not None:
+            raise self._error
+        return self._result

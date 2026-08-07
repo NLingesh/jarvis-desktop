@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 
 import './App.css';
 import VoiceOrb from './components/VoiceOrb';
 import Onboarding from './components/Onboarding';
+import { createPcm16Resampler, uint8ToBase64 } from './audioStream';
+import type { Resampler } from './audioStream';
 
 const Settings = lazy(() => import('./components/Settings'));
 const MemoryPage = lazy(() => import('./components/MemoryPage'));
@@ -91,62 +93,15 @@ function App() {
   const collapseTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const streamRef = useRef<MediaStream | null>(null);
   const isConnectedRef = useRef(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const resamplerRef = useRef<Resampler | null>(null);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const recordingTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const micPermissionGrantedRef = useRef(false);
   const micBusyRef = useRef(false);
-
-  const blobToWavBase64 = async (blob: Blob): Promise<string> => {
-    const arrayBuffer = await blob.arrayBuffer();
-    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-    const audioContext = new AudioCtx();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    await audioContext.close();
-
-    const targetRate = 16000;
-    const frameCount = Math.ceil(audioBuffer.duration * targetRate);
-    const offlineCtx = new OfflineAudioContext(1, frameCount, targetRate);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(offlineCtx.destination);
-    source.start(0);
-    const rendered = await offlineCtx.startRendering();
-    const pcmData = rendered.getChannelData(0);
-
-    const buffer = new ArrayBuffer(44 + pcmData.length * 2);
-    const view = new DataView(buffer);
-    const writeString = (offset: number, str: string) => {
-      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-    };
-    writeString(0, 'RIFF');
-    view.setUint32(4, 36 + pcmData.length * 2, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, targetRate, true);
-    view.setUint32(28, targetRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, 'data');
-    view.setUint32(40, pcmData.length * 2, true);
-    let offset = 44;
-    for (let i = 0; i < pcmData.length; i++, offset += 2) {
-      const s = Math.max(-1, Math.min(1, pcmData[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
-
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...Array.from(bytes.subarray(i, i + chunkSize)));
-    }
-    return btoa(binary);
-  };
+  const awaitingPongRef = useRef(false);
+  const pingSentAtRef = useRef(0);
 
   const getSessionToken = async (): Promise<string | null> => {
     const api = (window as any).electronAPI;
@@ -292,6 +247,7 @@ function App() {
 
         ws.current.onopen = () => {
           isConnectedRef.current = true;
+          awaitingPongRef.current = false;
           setError(null);
           reconnectDelay = 1000;
         };
@@ -305,7 +261,9 @@ function App() {
             return;
           }
 
-          if (data.type === 'response') {
+          if (data.type === 'pong') {
+            awaitingPongRef.current = false;
+          } else if (data.type === 'response') {
             setAssistantText(data.text);
             setSheetState('response');
             resetCollapseTimer();
@@ -398,8 +356,30 @@ function App() {
       }
     }, 5000);
 
+    // Heartbeat: send a ping every 25 s and force a reconnect if the server
+    // does not answer within 15 s (detects half-open connections).
+    const pingInterval = setInterval(() => {
+      const socket = ws.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      if (awaitingPongRef.current && Date.now() - pingSentAtRef.current > 15000) {
+        console.error('WebSocket heartbeat timed out; forcing reconnect');
+        socket.close();
+        return;
+      }
+      try {
+        socket.send(JSON.stringify({ type: 'ping' }));
+        awaitingPongRef.current = true;
+        pingSentAtRef.current = Date.now();
+      } catch (err) {
+        console.error('Failed to send heartbeat ping', err);
+      }
+    }, 25000);
+
     return () => {
       clearInterval(interval);
+      clearInterval(pingInterval);
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
       }
@@ -428,13 +408,22 @@ function App() {
       if (processingTimerRef.current) {
         clearTimeout(processingTimerRef.current);
       }
-      const recorder = mediaRecorderRef.current;
-      if (recorder && recorder.state !== 'inactive') {
+      if (audioProcessorRef.current) {
+        audioProcessorRef.current.onaudioprocess = null;
         try {
-          recorder.stop();
+          audioProcessorRef.current.disconnect();
         } catch (err) {
-          console.warn('Failed to stop recorder on unmount', err);
+          console.warn('Failed to stop audio processor on unmount', err);
         }
+        audioProcessorRef.current = null;
+      }
+      if (audioSourceRef.current) {
+        try {
+          audioSourceRef.current.disconnect();
+        } catch (err) {
+          console.warn('Failed to disconnect audio source on unmount', err);
+        }
+        audioSourceRef.current = null;
       }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track: MediaStreamTrack) => track.stop());
@@ -475,6 +464,31 @@ function App() {
     };
   }, [triggerWakeWord]);
 
+  const sendAudioStart = () => {
+    const socket = ws.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(
+      JSON.stringify({
+        type: 'audio_start',
+        format: 'pcm16',
+        sample_rate: 16000,
+        channels: 1,
+      }),
+    );
+  };
+
+  const sendAudioChunk = (bytes: Uint8Array) => {
+    const socket = ws.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'audio_chunk', data: uint8ToBase64(bytes) }));
+  };
+
+  const sendAudioEnd = () => {
+    const socket = ws.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'audio_end' }));
+  };
+
   const startRecording = async () => {
     try {
       const stream = await tryGetUserMedia({
@@ -489,29 +503,50 @@ function App() {
       setIsListening(true);
       listeningRef.current = true;
       setOrbState('listening');
+      setLiveTranscript('Recording... tap the orb again to send');
+      setSheetState('transcript');
+      resetCollapseTimer();
 
-      if (audioContext.current) {
-        if (audioContext.current.state === 'suspended') {
-          audioContext.current.resume().catch(() => {});
-        }
-        try {
-          const analyser = audioContext.current.createAnalyser();
-          const source = audioContext.current.createMediaStreamSource(stream);
-          source.connect(analyser);
-          analysers.current = [analyser];
-        } catch (analyserErr) {
-          console.warn('Analyser setup failed', analyserErr);
-        }
+      let ctx = audioContext.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioContext.current = ctx;
+      }
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
       }
 
-      startBackendRecording(stream);
+      // Stream PCM16 (16 kHz mono) to the backend as the user speaks instead of
+      // buffering a huge blob and converting it after the fact.
+      const source = ctx.createMediaStreamSource(stream);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      const resampler = createPcm16Resampler(16000, ctx.sampleRate);
+      source.connect(processor);
+      processor.connect(ctx.destination);
+
+      const analyser = ctx.createAnalyser();
+      source.connect(analyser);
+      analysers.current = [analyser];
+
+      sendAudioStart();
+      processor.onaudioprocess = (e: AudioProcessingEvent) => {
+        const input = e.inputBuffer.getChannelData(0);
+        const pcm = resampler.process(input);
+        if (pcm.length > 0) {
+          sendAudioChunk(pcm);
+        }
+      };
+
+      audioSourceRef.current = source;
+      audioProcessorRef.current = processor;
+      resamplerRef.current = resampler;
 
       // Safety: never record forever. Auto-stop after 30 seconds.
       if (recordingTimerRef.current) {
         clearTimeout(recordingTimerRef.current);
       }
       recordingTimerRef.current = setTimeout(() => {
-        if (mediaRecorderRef.current) {
+        if (audioProcessorRef.current) {
           stopManualRecording();
         }
       }, 30000);
@@ -533,57 +568,30 @@ function App() {
       clearTimeout(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
     }
+    if (audioProcessorRef.current) {
+      audioProcessorRef.current.onaudioprocess = null;
+      audioProcessorRef.current.disconnect();
+      audioProcessorRef.current = null;
+    }
+    if (audioSourceRef.current) {
+      try {
+        audioSourceRef.current.disconnect();
+      } catch (err) {
+        console.warn('Failed to disconnect audio source', err);
+      }
+      audioSourceRef.current = null;
+    }
+    resamplerRef.current = null;
     if (stream) {
       stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
     }
     streamRef.current = null;
     analysers.current = [];
-    mediaRecorderRef.current = null;
-    recordedChunksRef.current = [];
-  };
-
-  const startBackendRecording = (stream: MediaStream) => {
-    // Record audio locally and send it to the backend for offline transcription
-    // (Vosk - no API key needed). Tap the orb again to stop and send.
-    setLiveTranscript('Recording... tap the orb again to send');
-    setSheetState('transcript');
-    resetCollapseTimer();
-
-    let recorder: MediaRecorder;
-    try {
-      recorder = new MediaRecorder(stream);
-    } catch (recErr) {
-      cleanupListening(stream);
-      setIsListening(false);
-      listeningRef.current = false;
-      setError('MediaRecorder is not supported in this browser');
-      setOrbState('idle');
-      setSheetState('hidden');
-      return;
-    }
-    recordedChunksRef.current = [];
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        recordedChunksRef.current.push(e.data);
-      }
-    };
-    recorder.onerror = () => {
-      cleanupListening(stream);
-      setIsListening(false);
-      listeningRef.current = false;
-      setOrbState('idle');
-      setSheetState('hidden');
-      setError('Recording failed. Please try again.');
-    };
-    recorder.start();
-    mediaRecorderRef.current = recorder;
   };
 
   const stopManualRecording = async () => {
-    const recorder = mediaRecorderRef.current;
     const stream = streamRef.current;
-    if (!recorder) {
-      cleanupListening(stream);
+    if (!audioProcessorRef.current && !stream) {
       setIsListening(false);
       listeningRef.current = false;
       setOrbState('idle');
@@ -594,54 +602,32 @@ function App() {
     setIsListening(false);
     listeningRef.current = false;
 
-    recorder.onstop = async () => {
-      cleanupListening(stream);
-      const blob = new Blob(recordedChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-      recordedChunksRef.current = [];
-
-      if (blob.size === 0) {
-        setError('I could not hear anything. Please try again.');
-        setOrbState('idle');
-        setSheetState('hidden');
-        return;
-      }
-
-      setOrbState('thinking');
-      setLiveTranscript('Transcribing...');
-      resetCollapseTimer();
-      try {
-        const wavBase64 = await blobToWavBase64(blob);
-        if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
-          setError('Not connected to server');
-          setSheetState('hidden');
-          return;
-        }
-        setIsProcessing(true);
-        processingRef.current = true;
-        startProcessingWatchdog();
-        ws.current.send(
-          JSON.stringify({
-            type: 'audio',
-            audio_base64: wavBase64,
-          }),
-        );
-      } catch (err) {
-        console.error('Failed to transcribe audio', err);
-        setError('Failed to transcribe audio');
-        setIsProcessing(false);
-        processingRef.current = false;
-        setOrbState('idle');
-        setSheetState('hidden');
-      }
-    };
-
+    // Flush any resampler output buffered since the last onaudioprocess pass.
     try {
-      recorder.stop();
+      if (resamplerRef.current) {
+        const tail = resamplerRef.current.finish();
+        if (tail.length > 0) {
+          sendAudioChunk(tail);
+        }
+      }
     } catch (err) {
-      console.error('Failed to stop recorder', err);
-      cleanupListening(stream);
-      setOrbState('idle');
+      console.error('Failed to flush audio buffer', err);
     }
+
+    sendAudioEnd();
+    cleanupListening(stream);
+
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      setError('Not connected to server');
+      setSheetState('hidden');
+      return;
+    }
+
+    setOrbState('thinking');
+    setLiveTranscript('Transcribing...');
+    setIsProcessing(true);
+    processingRef.current = true;
+    startProcessingWatchdog();
   };
 
   const beginVoiceSession = async () => {
@@ -867,7 +853,7 @@ function App() {
               {isProcessing
                 ? 'Thinking...'
                 : isListening
-                  ? mediaRecorderRef.current
+                  ? audioProcessorRef.current
                     ? 'Tap to stop'
                     : 'Listening...'
                   : 'Tap to talk'}

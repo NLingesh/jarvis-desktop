@@ -7,9 +7,11 @@ logging, middleware, lifespan, the WebSocket handler, and router inclusion.
 """
 
 import asyncio
+import base64
 import contextlib
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -115,6 +117,15 @@ async def lifespan(app: FastAPI):
     await auth_service.bootstrap_user()
     await auth_service.cleanup()
     await vault.initialize()
+    # Warm up the Vosk model off the event loop so the first utterance is fast.
+    if stt.available and not os.getenv("JARVIS_SKIP_STT_PRELOAD"):
+        threading.Thread(target=stt.preload, daemon=True).start()
+        logger.info("Vosk model found at %s — preloading in background", stt.model_dir)
+    elif not stt.available:
+        logger.warning(
+            "Vosk model not found at %s — speech-to-text will fall back to cloud (or be unavailable)",
+            stt.model_dir,
+        )
     yield
     logger.info("JARVIS Backend shutting down...")
     await memory_manager.close()
@@ -161,23 +172,88 @@ async def health():
 # ---------------------------------------------------------------------------
 # WebSocket — voice pipeline
 # ---------------------------------------------------------------------------
+# Bound the number of simultaneous Vosk/cloud transcriptions so many concurrent
+# utterances cannot exhaust worker threads.
+STT_SEMAPHORE = asyncio.Semaphore(4)
+WS_IDLE_TIMEOUT = 90
+
+
+async def _finalize_audio_stream(stream, websocket) -> str:
+    """Finalize a streaming recognizer and return its transcription."""
+    try:
+        async with STT_SEMAPHORE:
+            user_input = await asyncio.to_thread(stream.finish)
+    except Exception as e:
+        logger.error("STT failed on websocket: %s", e)
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "message": f"Speech recognition failed: {e}"}
+            )
+        return ""
+    if not user_input:
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "message": "I could not hear anything. Please try again."}
+            )
+    return user_input
+
+
 @app.websocket("/ws/voice")
 async def websocket_endpoint(websocket: WebSocket):
     await validate_ws_token(websocket)
     await websocket.accept()
     session_id = await memory_manager.create_session()
+    pending_stream = None
 
     try:
         while True:
-            data = await websocket.receive_json()
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=WS_IDLE_TIMEOUT)
             msg_type = data.get("type")
 
-            if msg_type == "text":
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif msg_type == "text":
                 user_input = data.get("content", "").strip()
                 if not user_input:
                     continue
                 await handle_user_input(user_input, session_id, websocket)
+            elif msg_type == "audio_start":
+                # A new utterance while one is still open: finalize the old one first.
+                if pending_stream is not None:
+                    await _finalize_audio_stream(pending_stream, websocket)
+                sample_rate = int(data.get("sample_rate") or 16000)
+                pending_stream = stt.stream(sample_rate)
+                await websocket.send_json({"type": "status", "status": "transcribing"})
+            elif msg_type == "audio_chunk":
+                if pending_stream is None:
+                    await websocket.send_json(
+                        {"type": "error", "message": "audio_start must precede audio_chunk"}
+                    )
+                    continue
+                chunk_b64 = data.get("data")
+                if not chunk_b64:
+                    continue
+                try:
+                    pcm = base64.b64decode(chunk_b64)
+                except Exception as e:
+                    logger.warning("Invalid audio chunk: %s", e)
+                    await websocket.send_json({"type": "error", "message": "Invalid audio chunk"})
+                    continue
+                pending_stream.feed(pcm)
+            elif msg_type == "audio_end":
+                if pending_stream is None:
+                    await websocket.send_json(
+                        {"type": "error", "message": "audio_end without audio_start"}
+                    )
+                    continue
+                user_input = await _finalize_audio_stream(pending_stream, websocket)
+                pending_stream = None
+                if not user_input:
+                    continue
+                logger.info("User (voice): %s", user_input)
+                await handle_user_input(user_input, session_id, websocket)
             elif msg_type == "audio":
+                # Legacy whole-blob payload (backwards compatible).
                 audio_base64 = data.get("audio_base64") or data.get("audio")
                 if not audio_base64:
                     await websocket.send_json(
@@ -189,7 +265,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 await websocket.send_json({"type": "status", "status": "transcribing"})
                 try:
-                    user_input = await asyncio.to_thread(stt.transcribe_base64, audio_base64)
+                    async with STT_SEMAPHORE:
+                        user_input = await asyncio.to_thread(stt.transcribe_base64, audio_base64)
                 except Exception as e:
                     logger.error("STT failed on websocket: %s", e)
                     await websocket.send_json(
@@ -210,12 +287,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("User (voice): %s", user_input)
                 await handle_user_input(user_input, session_id, websocket)
 
+    except TimeoutError:
+        logger.info("WebSocket idle timeout, closing session %s", session_id)
     except WebSocketDisconnect:
         logger.info("Client disconnected, session %s saved", session_id)
     except Exception as e:
         logger.error("WebSocket error: %s", e)
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(e)})
+    finally:
+        if pending_stream is not None:
+            # The utterance never finished cleanly; abandon the worker thread.
+            pending_stream.abandon()
 
 
 # ---------------------------------------------------------------------------

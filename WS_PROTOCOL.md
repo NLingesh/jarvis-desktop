@@ -47,16 +47,58 @@ Send a text message (alternative to voice).
 }
 ```
 
-### `audio`
+### `audio_start`
 
-Send a base64-encoded WAV (PCM16, mono, 16 kHz) audio chunk for STT
-transcription.
+Begin a streaming voice utterance. The server resets its per-connection audio
+buffer and creates an incremental recognizer.
+
+```json
+{
+  "type": "audio_start",
+  "format": "pcm16",
+  "sample_rate": 16000,
+  "channels": 1
+}
+```
+
+### `audio_chunk`
+
+A chunk of raw PCM16 little-endian, mono audio (base64). Chunks are fed to the
+recognizer incrementally as they arrive; small chunks (≈50–100 ms) are
+recommended.
+
+```json
+{ "type": "audio_chunk", "data": "<base64 of PCM16 LE mono bytes>" }
+```
+
+### `audio_end`
+
+Finalize the current utterance and run transcription. The server responds with
+the normal `status` / `partial` / `response` / `error` flow.
+
+```json
+{ "type": "audio_end" }
+```
+
+### `audio` (legacy)
+
+Send a whole base64-encoded WAV (PCM16, mono, 16 kHz) in a single message. Still
+supported for backwards compatibility.
 
 ```json
 {
   "type": "audio",
   "audio_base64": "<base64-encoded WAV>"
 }
+```
+
+### `ping`
+
+Heartbeat. The server replies `{ "type": "pong" }`. Send one every ~25 s so the
+server never closes the connection for idleness.
+
+```json
+{ "type": "ping" }
 ```
 
 ---
@@ -126,6 +168,14 @@ Server-side error message.
 { "type": "error", "message": "Speech recognition failed: model not loaded" }
 ```
 
+### `pong`
+
+Reply to a client `ping` (heartbeat).
+
+```json
+{ "type": "pong" }
+```
+
 ---
 
 ## Disconnect / Reconnect
@@ -135,3 +185,7 @@ Server-side error message.
 * The frontend should reconnect with **exponential backoff + jitter**:
   1 s → 2 s → 4 s → 8 s → 16 s → 32 s → 60 s (capped), then repeat.
 * A reconnect attempt should include the same `token` query parameter.
+* The server closes connections that are idle for **90 s** (no message
+  received). Clients should send a `ping` every ~25 s to stay alive.
+* A dead/half-open connection is detected when a `ping` is not answered by a
+  `pong` within 15 s; the client then force-closes and reconnects.
