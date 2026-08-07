@@ -11,6 +11,7 @@ type SettingsState = {
   enableNotifications: boolean;
   serverUrl: string;
   enableWakeWord: boolean;
+  alwaysOnListening: boolean;
 };
 
 type EmailConfig = {

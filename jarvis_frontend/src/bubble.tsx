@@ -9,10 +9,30 @@ const WAKE_COOLDOWN_MS = 2000;
 
 function BubbleApp() {
   const [orbState, setOrbState] = useState<OrbState>('idle');
+  const [pttActive, setPttActive] = useState(false);
   const wakeRecognitionRef = useRef<any>(null);
   const isListeningRef = useRef(false);
   const lastWakeTriggerRef = useRef(0);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const voiceSettingsRef = useRef<{ enableWakeWord: boolean; alwaysOnListening: boolean }>({
+    enableWakeWord: true,
+    alwaysOnListening: false,
+  });
+
+  const reloadVoiceSettings = useCallback(() => {
+    const stored = localStorage.getItem('voiceSettings');
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        voiceSettingsRef.current = {
+          enableWakeWord: parsed.enableWakeWord ?? true,
+          alwaysOnListening: parsed.alwaysOnListening ?? false,
+        };
+      } catch (err) {
+        console.warn('Invalid voiceSettings in localStorage', err);
+      }
+    }
+  }, []);
 
   const playConfirmationChime = useCallback(() => {
     try {
@@ -86,6 +106,9 @@ function BubbleApp() {
   }, []);
 
   const startWakeWordListener = useCallback(() => {
+    if (!voiceSettingsRef.current.enableWakeWord) {
+      return;
+    }
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition || wakeRecognitionRef.current) {
@@ -169,14 +192,55 @@ function BubbleApp() {
     }
   }, []);
 
+  const pttDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragStartRef.current = null;
+    setPttActive(true);
+    setOrbState('listening');
+    const api = (window as any).electronAPI;
+    if (api?.bubbleVoiceControl) {
+      api.bubbleVoiceControl('start').catch(() => {});
+    }
+  }, []);
+
+  const pttUp = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragStartRef.current = null;
+    setPttActive(false);
+    setOrbState('idle');
+    const api = (window as any).electronAPI;
+    if (api?.bubbleVoiceControl) {
+      api.bubbleVoiceControl('stop').catch(() => {});
+    }
+  }, []);
+
   useEffect(() => {
+    reloadVoiceSettings();
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === 'voiceSettings') {
+        reloadVoiceSettings();
+        if (voiceSettingsRef.current.enableWakeWord) {
+          if (!wakeRecognitionRef.current && !isListeningRef.current) {
+            startWakeWordListener();
+          }
+        } else {
+          stopWakeWordListener();
+        }
+      }
+    };
+    window.addEventListener('storage', handleStorage);
     ensureMicPermission().then((granted) => {
       if (granted) {
         startWakeWordListener();
       }
     });
-    return () => stopWakeWordListener();
-  }, [ensureMicPermission, startWakeWordListener, stopWakeWordListener]);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      stopWakeWordListener();
+    };
+  }, [ensureMicPermission, reloadVoiceSettings, startWakeWordListener, stopWakeWordListener]);
 
   useEffect(() => {
     const api = (window as any).electronAPI;
@@ -184,7 +248,7 @@ function BubbleApp() {
       return undefined;
     }
     const unsubscribe = api.onMainWindowVisibility((visible: boolean) => {
-      if (visible) {
+      if (visible && !voiceSettingsRef.current.alwaysOnListening) {
         // Release the mic while the main window may be capturing audio.
         stopWakeWordListener();
       } else {
@@ -209,7 +273,7 @@ function BubbleApp() {
     const dist = Math.sqrt(dx * dx + dy * dy);
     dragStartRef.current = null;
 
-    if (dist < 3) {
+    if (dist < 3 && !pttActive) {
       const api = (window as any).electronAPI;
       if (api?.toggleMainWindow) {
         api.toggleMainWindow();
@@ -240,6 +304,26 @@ function BubbleApp() {
       }}
     >
       <VoiceOrb state={orbState} analysers={[]} />
+      <button
+        className={`ptt-button ${pttActive ? 'active' : ''}`}
+        onMouseDown={pttDown}
+        onMouseUp={pttUp}
+        onMouseLeave={pttUp}
+        onTouchStart={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          pttDown(e as unknown as React.MouseEvent);
+        }}
+        onTouchEnd={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          pttUp(e as unknown as React.MouseEvent);
+        }}
+        aria-label="Hold to talk"
+        title="Hold to talk"
+      >
+        {pttActive ? '●' : 'Talk'}
+      </button>
     </div>
   );
 }

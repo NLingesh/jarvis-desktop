@@ -12,6 +12,7 @@ import asyncio
 import os
 
 os.environ.setdefault("JARVIS_SKIP_STT_PRELOAD", "1")
+os.environ.setdefault("JARVIS_SKIP_PROACTIVE", "1")
 
 import pytest  # noqa: E402
 

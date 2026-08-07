@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 
 import './App.css';
 import VoiceOrb from './components/VoiceOrb';
 import Onboarding from './components/Onboarding';
-import { createPcm16Resampler, uint8ToBase64 } from './audioStream';
-import type { Resampler } from './audioStream';
+import { computeRms, uint8ToBase64 } from './audioStream';
+
+const PCM_WORKLET_URL = '/pcmWorklet.js';
 
 const Settings = lazy(() => import('./components/Settings'));
 const MemoryPage = lazy(() => import('./components/MemoryPage'));
@@ -37,6 +38,10 @@ class ErrorBoundary extends React.Component<
 type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking';
 type SheetState = 'hidden' | 'transcript' | 'response';
 
+const ENDPOINT_RMS_THRESHOLD = 500;
+const ENDPOINT_SILENCE_MS = 900;
+const LONG_TASK_MS = 10000;
+
 type SettingsState = {
   voice: string;
   volume: number;
@@ -45,6 +50,7 @@ type SettingsState = {
   enableNotifications: boolean;
   serverUrl: string;
   enableWakeWord: boolean;
+  alwaysOnListening: boolean;
 };
 
 type EmailConfig = {
@@ -67,15 +73,28 @@ function App() {
   const [liveTranscript, setLiveTranscript] = useState('');
   const [assistantText, setAssistantText] = useState('');
   const [textInput, setTextInput] = useState('');
-  const [settings, setSettings] = useState<SettingsState>(() => ({
-    voice: 'en-US',
-    volume: 0.8,
-    speed: 1.0,
-    theme: 'dark',
-    enableNotifications: true,
-    serverUrl: localStorage.getItem('serverUrl') || 'localhost:8000',
-    enableWakeWord: true,
-  }));
+  const [isEndpointing, setIsEndpointing] = useState(false);
+  const [settings, setSettings] = useState<SettingsState>(() => {
+    const stored = localStorage.getItem('voiceSettings');
+    let parsed: Partial<SettingsState> = {};
+    if (stored) {
+      try {
+        parsed = JSON.parse(stored);
+      } catch (err) {
+        console.warn('Invalid voiceSettings in localStorage', err);
+      }
+    }
+    return {
+      voice: parsed.voice ?? 'en-US',
+      volume: parsed.volume ?? 0.8,
+      speed: parsed.speed ?? 1.0,
+      theme: parsed.theme ?? 'dark',
+      enableNotifications: parsed.enableNotifications ?? true,
+      serverUrl: localStorage.getItem('serverUrl') || parsed.serverUrl || 'localhost:8000',
+      enableWakeWord: parsed.enableWakeWord ?? true,
+      alwaysOnListening: parsed.alwaysOnListening ?? false,
+    };
+  });
   const [emailConfig, setEmailConfig] = useState<EmailConfig>(() => ({
     email: localStorage.getItem('emailAddress') || '',
     appPassword: '',
@@ -94,14 +113,20 @@ function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const isConnectedRef = useRef(false);
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const resamplerRef = useRef<Resampler | null>(null);
+  const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const processingTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const recordingTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const micPermissionGrantedRef = useRef(false);
   const micBusyRef = useRef(false);
   const awaitingPongRef = useRef(false);
   const pingSentAtRef = useRef(0);
+  const recordingStartedAtRef = useRef(0);
+  const speechDetectedRef = useRef(false);
+  const silenceStartRef = useRef<number | null>(null);
+  const flushResolveRef = useRef<(() => void) | null>(null);
+  const requestStartRef = useRef(0);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   const getSessionToken = async (): Promise<string | null> => {
     const api = (window as any).electronAPI;
@@ -268,6 +293,19 @@ function App() {
             setSheetState('response');
             resetCollapseTimer();
 
+            if (requestStartRef.current && settingsRef.current.enableNotifications) {
+              const elapsed = Date.now() - requestStartRef.current;
+              if (elapsed >= LONG_TASK_MS) {
+                const api = (window as any).electronAPI;
+                if (api?.showNotification) {
+                  api
+                    .showNotification('JARVIS', 'Your request is ready.')
+                    .catch((err: unknown) => console.warn('Notification failed', err));
+                }
+              }
+            }
+            requestStartRef.current = 0;
+
             if (data.audio) {
               enqueueAudioRef.current(data.audio);
             }
@@ -282,11 +320,28 @@ function App() {
             setAssistantText(data.text);
             setSheetState('response');
             resetCollapseTimer();
+          } else if (data.type === 'transcript') {
+            setLiveTranscript(data.text);
+            resetCollapseTimer();
           } else if (data.type === 'status') {
             if (data.status === 'processing') {
               setOrbState('thinking');
             } else if (data.status === 'generating_speech') {
               setOrbState('speaking');
+            }
+          } else if (data.type === 'proactive') {
+            if (data.text) {
+              setAssistantText(data.text);
+              setSheetState('response');
+              resetCollapseTimer();
+              if (settingsRef.current.enableNotifications) {
+                const api = (window as any).electronAPI;
+                if (api?.showNotification) {
+                  api
+                    .showNotification('JARVIS reminder', data.text)
+                    .catch((err: unknown) => console.warn('Notification failed', err));
+                }
+              }
             }
           } else if (data.type === 'audio_queue') {
             setOrbState('speaking');
@@ -305,6 +360,19 @@ function App() {
           } else if (data.type === 'error') {
             setError(data.message);
             setOrbState('idle');
+            if (
+              requestStartRef.current &&
+              settingsRef.current.enableNotifications &&
+              Date.now() - requestStartRef.current >= LONG_TASK_MS
+            ) {
+              const api = (window as any).electronAPI;
+              if (api?.showNotification) {
+                api
+                  .showNotification('JARVIS', 'Something went wrong while processing your request.')
+                  .catch((err: unknown) => console.warn('Notification failed', err));
+              }
+            }
+            requestStartRef.current = 0;
             if (processingTimerRef.current) {
               clearTimeout(processingTimerRef.current);
               processingTimerRef.current = undefined;
@@ -408,14 +476,14 @@ function App() {
       if (processingTimerRef.current) {
         clearTimeout(processingTimerRef.current);
       }
-      if (audioProcessorRef.current) {
-        audioProcessorRef.current.onaudioprocess = null;
+      if (audioWorkletNodeRef.current) {
+        audioWorkletNodeRef.current.port.onmessage = null;
         try {
-          audioProcessorRef.current.disconnect();
+          audioWorkletNodeRef.current.disconnect();
         } catch (err) {
-          console.warn('Failed to stop audio processor on unmount', err);
+          console.warn('Failed to stop audio worklet on unmount', err);
         }
-        audioProcessorRef.current = null;
+        audioWorkletNodeRef.current = null;
       }
       if (audioSourceRef.current) {
         try {
@@ -489,6 +557,29 @@ function App() {
     socket.send(JSON.stringify({ type: 'audio_end' }));
   };
 
+  const checkEndpointing = (pcm: Uint8Array) => {
+    if (pcm.length === 0) return;
+    const rms = computeRms(pcm);
+    if (rms > ENDPOINT_RMS_THRESHOLD) {
+      speechDetectedRef.current = true;
+      silenceStartRef.current = null;
+      return;
+    }
+    if (!speechDetectedRef.current) return;
+    if (Date.now() - recordingStartedAtRef.current < 1000) return;
+    if (silenceStartRef.current === null) {
+      silenceStartRef.current = Date.now();
+      return;
+    }
+    if (Date.now() - silenceStartRef.current >= ENDPOINT_SILENCE_MS) {
+      silenceStartRef.current = null;
+      setIsEndpointing(true);
+      if (audioWorkletNodeRef.current) {
+        void stopManualRecording();
+      }
+    }
+  };
+
   const startRecording = async () => {
     try {
       const stream = await tryGetUserMedia({
@@ -506,7 +597,7 @@ function App() {
       setLiveTranscript('Recording... tap the orb again to send');
       setSheetState('transcript');
       resetCollapseTimer();
-
+      setIsEndpointing(false);
       let ctx = audioContext.current;
       if (!ctx || ctx.state === 'closed') {
         ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -516,38 +607,57 @@ function App() {
         ctx.resume().catch(() => {});
       }
 
-      // Stream PCM16 (16 kHz mono) to the backend as the user speaks instead of
-      // buffering a huge blob and converting it after the fact.
+      // Resampling + PCM16 encoding happen off the main thread in the worklet.
+      await ctx.audioWorklet.addModule(PCM_WORKLET_URL);
+
       const source = ctx.createMediaStreamSource(stream);
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
-      const resampler = createPcm16Resampler(16000, ctx.sampleRate);
-      source.connect(processor);
-      processor.connect(ctx.destination);
+      const worklet = new AudioWorkletNode(ctx, 'pcm16-capture', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        processorOptions: { sampleRate: ctx.sampleRate },
+      });
+      // Pull the worklet through a zero-gain node so capture stays active
+      // without routing the mic to the speakers.
+      const zeroGain = ctx.createGain();
+      zeroGain.gain.value = 0;
+      source.connect(worklet);
+      worklet.connect(zeroGain);
+      zeroGain.connect(ctx.destination);
 
       const analyser = ctx.createAnalyser();
       source.connect(analyser);
       analysers.current = [analyser];
 
-      sendAudioStart();
-      processor.onaudioprocess = (e: AudioProcessingEvent) => {
-        const input = e.inputBuffer.getChannelData(0);
-        const pcm = resampler.process(input);
-        if (pcm.length > 0) {
-          sendAudioChunk(pcm);
+      worklet.port.onmessage = (event) => {
+        if (!event.data || event.data.type !== 'pcm') return;
+        const bytes = event.data.pcm as ArrayBuffer;
+        if (bytes && bytes.byteLength > 0) {
+          sendAudioChunk(new Uint8Array(bytes));
         }
+        if (event.data.final) {
+          const resolve = flushResolveRef.current;
+          flushResolveRef.current = null;
+          if (resolve) resolve();
+          return;
+        }
+        checkEndpointing(new Uint8Array(bytes));
       };
 
+      sendAudioStart();
       audioSourceRef.current = source;
-      audioProcessorRef.current = processor;
-      resamplerRef.current = resampler;
+      audioWorkletNodeRef.current = worklet;
+
+      recordingStartedAtRef.current = Date.now();
+      speechDetectedRef.current = false;
+      silenceStartRef.current = null;
 
       // Safety: never record forever. Auto-stop after 30 seconds.
       if (recordingTimerRef.current) {
         clearTimeout(recordingTimerRef.current);
       }
       recordingTimerRef.current = setTimeout(() => {
-        if (audioProcessorRef.current) {
-          stopManualRecording();
+        if (audioWorkletNodeRef.current) {
+          void stopManualRecording();
         }
       }, 30000);
     } catch (err) {
@@ -568,10 +678,10 @@ function App() {
       clearTimeout(recordingTimerRef.current);
       recordingTimerRef.current = undefined;
     }
-    if (audioProcessorRef.current) {
-      audioProcessorRef.current.onaudioprocess = null;
-      audioProcessorRef.current.disconnect();
-      audioProcessorRef.current = null;
+    if (audioWorkletNodeRef.current) {
+      audioWorkletNodeRef.current.port.onmessage = null;
+      audioWorkletNodeRef.current.disconnect();
+      audioWorkletNodeRef.current = null;
     }
     if (audioSourceRef.current) {
       try {
@@ -581,17 +691,17 @@ function App() {
       }
       audioSourceRef.current = null;
     }
-    resamplerRef.current = null;
     if (stream) {
       stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
     }
     streamRef.current = null;
     analysers.current = [];
+    silenceStartRef.current = null;
   };
 
   const stopManualRecording = async () => {
     const stream = streamRef.current;
-    if (!audioProcessorRef.current && !stream) {
+    if (!audioWorkletNodeRef.current && !stream) {
       setIsListening(false);
       listeningRef.current = false;
       setOrbState('idle');
@@ -602,13 +712,22 @@ function App() {
     setIsListening(false);
     listeningRef.current = false;
 
-    // Flush any resampler output buffered since the last onaudioprocess pass.
+    // Ask the worklet to emit the deferred boundary sample and any remaining
+    // PCM, then send audio_end only after the tail has been transmitted.
     try {
-      if (resamplerRef.current) {
-        const tail = resamplerRef.current.finish();
-        if (tail.length > 0) {
-          sendAudioChunk(tail);
-        }
+      const worklet = audioWorkletNodeRef.current;
+      if (worklet) {
+        await new Promise<void>((resolve) => {
+          flushResolveRef.current = resolve;
+          worklet.port.postMessage({ type: 'flush' });
+          // Safety: never wait forever if the worklet is already gone.
+          setTimeout(() => {
+            if (flushResolveRef.current) {
+              flushResolveRef.current = null;
+              resolve();
+            }
+          }, 500);
+        });
       }
     } catch (err) {
       console.error('Failed to flush audio buffer', err);
@@ -616,6 +735,7 @@ function App() {
 
     sendAudioEnd();
     cleanupListening(stream);
+    setIsEndpointing(false);
 
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
       setError('Not connected to server');
@@ -627,6 +747,7 @@ function App() {
     setLiveTranscript('Transcribing...');
     setIsProcessing(true);
     processingRef.current = true;
+    requestStartRef.current = Date.now();
     startProcessingWatchdog();
   };
 
@@ -677,6 +798,29 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [toggleTalk]);
 
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onVoiceControl) return;
+
+    const handler = (action: string) => {
+      if (action === 'start') {
+        if (listeningRef.current || processingRef.current) return;
+        beginVoiceSession();
+      } else if (action === 'stop') {
+        if (listeningRef.current) {
+          stopManualRecording();
+        }
+      }
+    };
+
+    const unsubscribe = api.onVoiceControl(handler);
+    return () => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    };
+  }, [beginVoiceSession, stopManualRecording]);
+
   const startProcessingWatchdog = () => {
     if (processingTimerRef.current) {
       clearTimeout(processingTimerRef.current);
@@ -704,6 +848,7 @@ function App() {
       processingRef.current = true;
       setOrbState('thinking');
       resetCollapseTimer();
+      requestStartRef.current = Date.now();
       startProcessingWatchdog();
 
       ws.current.send(
@@ -853,11 +998,18 @@ function App() {
               {isProcessing
                 ? 'Thinking...'
                 : isListening
-                  ? audioProcessorRef.current
-                    ? 'Tap to stop'
-                    : 'Listening...'
+                  ? isEndpointing
+                    ? 'Finishing...'
+                    : audioWorkletNodeRef.current
+                      ? 'Tap to stop'
+                      : 'Listening...'
                   : 'Tap to talk'}
             </div>
+            {isListening && liveTranscript && (
+              <div className="orb-caption" aria-live="polite">
+                {liveTranscript}
+              </div>
+            )}
           </div>
 
           <button

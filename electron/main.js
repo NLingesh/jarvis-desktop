@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, session, Tray, nativeImage, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, Tray, nativeImage, globalShortcut, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -670,6 +670,25 @@ ipcMain.handle('notify-wake-word-detected', () => {
   showMainWindowFromWakeWord(true);
 });
 ipcMain.handle('get-session-token', () => sessionToken);
+
+ipcMain.handle('show-notification', (_event, { title, body }) => {
+  try {
+    if (!Notification.isSupported()) return { success: false, error: 'not supported' };
+    new Notification({ title, body }).show();
+    return { success: true };
+  } catch (err) {
+    log(`Could not show notification: ${err.message}`);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('bubble-voice-control', (_event, action) => {
+  showMainWindow(true);
+  if (mainWindow && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send('voice-control', action);
+  }
+});
+
 
 ipcMain.handle('get-vault-path', () => getVaultPath());
 ipcMain.handle('open-vault', async () => {

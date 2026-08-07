@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import FileResponse, Response
 
+from modules.proactive import ProactiveMonitor
 from routes.auth import router as auth_router
 from routes.calendar import router as calendar_router
 from routes.llm import router as llm_router
@@ -30,8 +31,11 @@ from routes.notes import router as notes_router
 from routes.settings import router as settings_router
 from routes.state import (
     auth_service,
+    calendar,
     handle_user_input,
+    mail_sessions,
     memory_manager,
+    stream_speech_to_socket,
     stt,
     validate_ws_token,
     vault,
@@ -42,6 +46,9 @@ from routes.vault import router as vault_router
 from routes.vision import router as vision_router
 
 logger = logging.getLogger(__name__)
+
+# Connected /ws/voice sockets, used to broadcast proactive reminders.
+_connected_sockets: set[WebSocket] = set()
 
 # ---------------------------------------------------------------------------
 # CORS configuration
@@ -126,8 +133,25 @@ async def lifespan(app: FastAPI):
             "Vosk model not found at %s — speech-to-text will fall back to cloud (or be unavailable)",
             stt.model_dir,
         )
+
+    async def _deliver_proactive(text: str) -> None:
+        sockets = list(_connected_sockets)
+        for socket in sockets:
+            with contextlib.suppress(Exception):
+                await socket.send_json({"type": "proactive", "text": text})
+                await stream_speech_to_socket(socket, text)
+
+    proactive = ProactiveMonitor(
+        calendar=calendar,
+        mail_sessions=mail_sessions,
+        deliver=_deliver_proactive,
+    )
+    if not os.getenv("JARVIS_SKIP_PROACTIVE"):
+        await proactive.start()
+
     yield
     logger.info("JARVIS Backend shutting down...")
+    await proactive.stop()
     await memory_manager.close()
     await vault.close()
 
@@ -202,8 +226,19 @@ async def _finalize_audio_stream(stream, websocket) -> str:
 async def websocket_endpoint(websocket: WebSocket):
     await validate_ws_token(websocket)
     await websocket.accept()
+    _connected_sockets.add(websocket)
     session_id = await memory_manager.create_session()
     pending_stream = None
+    loop = asyncio.get_running_loop()
+
+    def send_partial(text: str) -> None:
+        """Deliver a live STT hypothesis from the recognizer thread to the socket."""
+
+        async def _send() -> None:
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "transcript", "text": text})
+
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
     try:
         while True:
@@ -222,7 +257,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if pending_stream is not None:
                     await _finalize_audio_stream(pending_stream, websocket)
                 sample_rate = int(data.get("sample_rate") or 16000)
-                pending_stream = stt.stream(sample_rate)
+                pending_stream = stt.stream(sample_rate, on_partial=send_partial)
                 await websocket.send_json({"type": "status", "status": "transcribing"})
             elif msg_type == "audio_chunk":
                 if pending_stream is None:
@@ -296,6 +331,7 @@ async def websocket_endpoint(websocket: WebSocket):
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(e)})
     finally:
+        _connected_sockets.discard(websocket)
         if pending_stream is not None:
             # The utterance never finished cleanly; abandon the worker thread.
             pending_stream.abandon()

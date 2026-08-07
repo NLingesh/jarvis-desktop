@@ -185,6 +185,47 @@ else:
     vault = VaultManager(MEMORY_VAULT_PATH)
 notes = NotesModule(vault=vault)
 
+# --- User profile note (vault-backed preferences) ---------------------------
+PROFILE_NOTE_PATH = "People/me.md"
+_PROFILE_NOTE_BODY = "## About\n(Add things to remember about the user here.)"
+
+
+async def get_profile_note() -> dict | None:
+    """Return the user profile/preferences note, or None if it does not exist."""
+    try:
+        return await vault.get_note(PROFILE_NOTE_PATH)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+async def ensure_profile_note() -> dict | None:
+    """Create the profile note if missing and return it (None on failure)."""
+    note = await get_profile_note()
+    if note:
+        return note
+    try:
+        return await vault.create_note(
+            title="Me",
+            folder="People",
+            note_type="person",
+            tags=["profile"],
+            content=_PROFILE_NOTE_BODY,
+        )
+    except Exception:
+        return None
+
+
+async def reset_profile_note() -> bool:
+    """Clear the profile note back to its empty scaffold."""
+    try:
+        await vault.update_note(PROFILE_NOTE_PATH, content=_PROFILE_NOTE_BODY)
+        return True
+    except Exception:
+        return False
+
+
 skill_registry = SkillRegistry()
 
 
@@ -395,6 +436,43 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
             return context
 
     user_lower = user_input.lower()
+
+    # --- Profile / preferences commands --------------------------------------
+    remember_match = re.match(
+        r"(?:remember|note down|don't forget|please remember)\s+(?:that\s+)?(.*)",
+        user_input,
+        re.IGNORECASE,
+    )
+    if remember_match and remember_match.group(1).strip():
+        fact = remember_match.group(1).strip().strip(".")
+        note = await ensure_profile_note()
+        if note:
+            existing = (note.get("body") or "").rstrip()
+            line = f"- {fact}"
+            if line not in existing:
+                new_body = f"{existing}\n{line}" if existing.strip() else f"## About\n{line}"
+                with contextlib.suppress(Exception):
+                    await vault.update_note(PROFILE_NOTE_PATH, content=new_body)
+        context["profile"] = {"action": "remembered", "fact": fact}
+        return context
+
+    if re.search(r"forget (?:my )?(?:preferences|profile|about me)", user_lower) or user_lower in (
+        "forget me",
+        "reset profile",
+        "clear my profile",
+    ):
+        await reset_profile_note()
+        context["profile"] = {"action": "forgotten"}
+        return context
+
+    if "know about me" in user_lower or ("about me" in user_lower and "know" in user_lower):
+        note = await get_profile_note()
+        context["profile"] = {
+            "action": "read",
+            "content": (note or {}).get("body") or "No profile saved yet.",
+        }
+        return context
+
     document_keywords = [
         "document",
         "file",
@@ -480,6 +558,35 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
     return context
 
 
+async def _stream_sentence_audio(websocket, sentence: str) -> None:
+    """Stream TTS audio for one sentence using the standard segment flow."""
+    await websocket.send_json({"type": "audio_segment_start"})
+    try:
+        async for audio_chunk in tts.stream_speech(sentence):
+            await websocket.send_json({"type": "audio_chunk", "chunk": audio_chunk})
+    except Exception:
+        try:
+            audio_base64 = await tts.generate_speech(sentence)
+            if audio_base64:
+                await websocket.send_json({"type": "audio_chunk", "chunk": audio_base64})
+        except Exception as e:
+            logger.error("TTS failed for sentence: %s", e)
+    await websocket.send_json({"type": "audio_segment_end"})
+
+
+async def stream_speech_to_socket(websocket, text: str) -> None:
+    """Speak ``text`` over a websocket using the standard TTS segment flow."""
+    text = (text or "").strip()
+    if not text:
+        return
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not sentences:
+        sentences = [text]
+    await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
+    for sentence in sentences:
+        await _stream_sentence_audio(websocket, sentence)
+
+
 async def handle_user_input(user_input: str, session_id: str, websocket) -> None:
     """Process a single user utterance: gather context, stream LLM reply and TTS."""
     from starlette.websockets import WebSocketDisconnect  # noqa: F401
@@ -496,6 +603,12 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
 
     try:
         context = await process_command(user_input, session_id=session_id)
+
+        # Inject the user profile/preferences note so the LLM knows the user.
+        profile = await get_profile_note()
+        if profile and profile.get("body"):
+            context["profile"] = profile["body"]
+
         conversation = await memory_manager.get_conversation(session_id)
 
         memory_results = []
@@ -552,26 +665,11 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
         await memory_manager.add_message(session_id, "assistant", full_text.strip())
 
         if sentences:
+            await websocket.send_json({"type": "status", "status": "generating_speech"})
             await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
 
             for sentence in sentences:
-                await websocket.send_json({"type": "audio_segment_start"})
-                try:
-                    async for audio_chunk in tts.stream_speech(sentence):
-                        await websocket.send_json({"type": "audio_chunk", "chunk": audio_chunk})
-                except Exception:
-                    try:
-                        audio_base64 = await tts.generate_speech(sentence)
-                        if audio_base64:
-                            await websocket.send_json(
-                                {
-                                    "type": "audio_chunk",
-                                    "chunk": audio_base64,
-                                }
-                            )
-                    except Exception as e:
-                        logger.error("TTS failed for sentence: %s", e)
-                await websocket.send_json({"type": "audio_segment_end"})
+                await _stream_sentence_audio(websocket, sentence)
 
         await websocket.send_json(
             {

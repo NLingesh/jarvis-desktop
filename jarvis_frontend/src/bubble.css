@@ -43,3 +43,24 @@ html, body {
   height: 100%;
   display: block;
 }
+
+.ptt-button {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  border: none;
+  border-radius: 16px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  background: rgba(255, 255, 255, 0.85);
+  color: #111;
+}
+
+.ptt-button.active {
+  background: #3b82f6;
+  color: #fff;
+}

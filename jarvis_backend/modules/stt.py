@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import wave
+from collections.abc import Callable
 
 import httpx
 
@@ -122,9 +123,15 @@ class SpeechToTextModule:
         """Load the Vosk model in the background so the first utterance is fast."""
         return self._ensure_loaded()
 
-    def stream(self, sample_rate: int = 16000) -> "_StreamingRecognizer":
-        """Create a streaming recognizer for an in-progress utterance."""
-        return _StreamingRecognizer(self, sample_rate)
+    def stream(
+        self, sample_rate: int = 16000, on_partial: "Callable[[str], None] | None" = None
+    ) -> "_StreamingRecognizer":
+        """Create a streaming recognizer for an in-progress utterance.
+
+        ``on_partial`` is invoked from the worker thread with the live partial
+        hypothesis whenever it changes (may be called many times per utterance).
+        """
+        return _StreamingRecognizer(self, sample_rate, on_partial)
 
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -147,9 +154,16 @@ class _StreamingRecognizer:
     or returns no text, the cloud fallback is used with the accumulated WAV.
     """
 
-    def __init__(self, stt_module: "SpeechToTextModule", sample_rate: int):
+    def __init__(
+        self,
+        stt_module: "SpeechToTextModule",
+        sample_rate: int,
+        on_partial: "Callable[[str], None] | None" = None,
+    ):
         self._stt = stt_module
         self._sample_rate = sample_rate
+        self._on_partial = on_partial
+        self._last_partial = ""
         self._queue: queue.Queue[bytes | None] = queue.Queue()
         self._done = threading.Event()
         self._result = ""
@@ -170,6 +184,15 @@ class _StreamingRecognizer:
                         break
                     self._pcm_all.extend(chunk)
                     recognizer.AcceptWaveform(chunk)
+                    if self._on_partial is not None:
+                        try:
+                            partial = json.loads(recognizer.PartialResult())
+                            text = (partial.get("partial") or "").strip()
+                            if text and text != self._last_partial:
+                                self._last_partial = text
+                                self._on_partial(text)
+                        except Exception:
+                            logger.warning("PartialResult unavailable, ignoring", exc_info=True)
                 result = json.loads(recognizer.FinalResult())
                 text = (result.get("text") or "").strip()
                 if text:

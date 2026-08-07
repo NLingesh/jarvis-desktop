@@ -8,6 +8,7 @@ type SettingsState = {
   enableNotifications: boolean;
   serverUrl: string;
   enableWakeWord: boolean;
+  alwaysOnListening: boolean;
 };
 
 type EmailConfig = {
@@ -119,6 +120,16 @@ const Settings: React.FC<SettingsProps> = ({
                 onChange={(e) => handleSettingChange('enableWakeWord', e.target.checked)}
               />
               <label htmlFor="wake-word">Enable wake word detection</label>
+            </div>
+
+            <div className="setting-item checkbox">
+              <input
+                type="checkbox"
+                id="always-on"
+                checked={settings.alwaysOnListening}
+                onChange={(e) => handleSettingChange('alwaysOnListening', e.target.checked)}
+              />
+              <label htmlFor="always-on">Always-on listening</label>
             </div>
           </div>
 

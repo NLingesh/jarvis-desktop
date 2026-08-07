@@ -85,3 +85,19 @@ export const decodePcm16Le = (bytes: Uint8Array): number[] => {
   }
   return out;
 };
+
+/**
+ * Root-mean-square energy of a PCM16 little-endian byte buffer, scaled to the
+ * Int16 full range (0..~32768). Used for silence/endpoint detection.
+ */
+export const computeRms = (pcm: Uint8Array): number => {
+  const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  const count = Math.floor(pcm.byteLength / 2);
+  if (count === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < count; i++) {
+    const s = view.getInt16(i * 2, true);
+    sum += s * s;
+  }
+  return Math.sqrt(sum / count);
+};

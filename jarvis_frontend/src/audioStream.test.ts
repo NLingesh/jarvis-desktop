@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createPcm16Resampler, decodePcm16Le, uint8ToBase64 } from './audioStream';
+import { computeRms, createPcm16Resampler, decodePcm16Le, uint8ToBase64 } from './audioStream';
 
 describe('createPcm16Resampler', () => {
   it('outputs 16 kHz PCM16 for a 48 kHz input', () => {
@@ -72,5 +72,33 @@ describe('uint8ToBase64', () => {
     const b64 = uint8ToBase64(bytes);
     const decoded = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     expect(decoded).toEqual(bytes);
+  });
+});
+
+describe('computeRms', () => {
+  const toPcm = (samples: number[]) => {
+    const bytes = new Uint8Array(samples.length * 2);
+    const view = new DataView(bytes.buffer);
+    samples.forEach((s, i) => view.setInt16(i * 2, s, true));
+    return bytes;
+  };
+
+  it('returns 0 for empty input', () => {
+    expect(computeRms(new Uint8Array(0))).toBe(0);
+  });
+
+  it('returns 0 for silence', () => {
+    expect(computeRms(toPcm([0, 0, 0, 0]))).toBe(0);
+  });
+
+  it('measures full-scale constant energy', () => {
+    const rms = computeRms(toPcm([32000, -32000, 32000, -32000]));
+    expect(rms).toBeGreaterThan(31000);
+  });
+
+  it('returns a small value for low-amplitude audio', () => {
+    const rms = computeRms(toPcm([100, -100, 100, -100]));
+    expect(rms).toBeGreaterThan(90);
+    expect(rms).toBeLessThan(120);
   });
 });

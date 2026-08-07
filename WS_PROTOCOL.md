@@ -119,6 +119,16 @@ Possible status values:
 | `processing`        | Transcription complete; generating LLM response        |
 | `generating_speech` | LLM response ready; producing TTS audio                |
 
+### `transcript`
+
+Live speech-to-text hypothesis while the user is still speaking (streamed from
+Vosk `PartialResult`). Distinct from `partial` (which carries the assistant's
+LLM response). The client should render this as the user's live caption.
+
+```json
+{ "type": "transcript", "text": "hello my name is..." }
+```
+
 ### `partial`
 
 Streaming partial LLM response text (sent as chunks arrive).
@@ -175,6 +185,27 @@ Reply to a client `ping` (heartbeat).
 ```json
 { "type": "pong" }
 ```
+
+### `proactive`
+
+Unsolicited reminder pushed by the backend's background proactive loop. The
+client should speak/surface the summary and may show a desktop notification.
+
+```json
+{ "type": "proactive", "text": "You have 2 events in the next hour. Your first reminder 'Call Sam' is at 3:00 PM. You also have 1 unread email." }
+```
+
+---
+
+## Client → Main Window (Electron IPC)
+
+The bubble window and the main window talk through the Electron main process.
+
+| Channel                 | Payload                      | Direction                      | Effect                                    |
+|--------------------------|------------------------------|--------------------------------|-------------------------------------------|
+| `bubble-voice-control`   | `{ action: 'start'\|'stop' }` | bubble → main process → main | Shows the main window and starts/stops the voice session |
+| `voice-control`          | `'start'\|'stop'`            | main process → main window    | `App.tsx` begins/ends `beginVoiceSession()` / `stopManualRecording()` |
+| `show-notification`      | `{ title, body }`            | main window → main process    | Shows a desktop notification (Electron)   |
 
 ---
 

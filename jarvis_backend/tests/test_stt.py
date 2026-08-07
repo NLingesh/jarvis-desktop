@@ -105,6 +105,34 @@ def test_stream_empty_result_falls_back_to_cloud():
     assert result == "fallback transcript"
 
 
+def test_stream_emits_partials():
+    stt = SpeechToTextModule(model_dir="/nonexistent/path")
+    stt.openai_api_key = None
+
+    rec = MagicMock()
+    rec.FinalResult.return_value = '{"text": "hello world"}'
+    rec.PartialResult.side_effect = [
+        '{"partial": "hello"}',
+        '{"partial": "hello"}',
+        '{"partial": "hello world"}',
+    ]
+
+    partials: list[str] = []
+
+    with (
+        patch.object(stt, "_ensure_loaded", return_value=True),
+        patch("modules.stt.KaldiRecognizer", return_value=rec),
+    ):
+        stream = stt.stream(16000, on_partial=partials.append)
+        stream.feed(b"\x00" * 1600)
+        stream.feed(b"\x00" * 1600)
+        stream.feed(b"\x00" * 1600)
+        result = stream.finish()
+
+    assert result == "hello world"
+    assert partials == ["hello", "hello world"]
+
+
 def test_stream_without_vosk_or_cloud_raises():
     stt = SpeechToTextModule(model_dir="/nonexistent/path")
     stt.openai_api_key = None

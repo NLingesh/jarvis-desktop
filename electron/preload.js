@@ -13,6 +13,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notifyWakeWordDetected: () => ipcRenderer.invoke('notify-wake-word-detected'),
   getSessionToken: () => ipcRenderer.invoke('get-session-token'),
 
+  showNotification: (title, body) => ipcRenderer.invoke('show-notification', { title, body }),
+  bubbleVoiceControl: (action) => ipcRenderer.invoke('bubble-voice-control', action),
+
+  onVoiceControl: (callback: (action: string) => void) => {
+    const handler = (_event: any, action: string) => callback(action);
+    ipcRenderer.on('voice-control', handler);
+    return () => ipcRenderer.removeListener('voice-control', handler);
+  },
+
   getVaultPath: () => ipcRenderer.invoke('get-vault-path'),
   openVault: () => ipcRenderer.invoke('open-vault'),
 

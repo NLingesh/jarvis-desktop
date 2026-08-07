@@ -67,6 +67,22 @@ body {
   text-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
 }
 
+.orb-caption {
+  position: absolute;
+  bottom: 10%;
+  left: 10%;
+  right: 10%;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  pointer-events: none;
+  text-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Visible fallback when the WebGL context cannot be created (prevents a black window) */
 .orb-fallback {
   width: 100%;
