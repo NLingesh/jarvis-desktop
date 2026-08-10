@@ -14,6 +14,7 @@ import {
 } from './voiceDiagnostics';
 import { VoiceState, transition, type VoiceStateContext } from './voiceStateMachine';
 import { ToastProvider } from './components/ToastProvider';
+import type { OrbState } from './orb/OrbEngine';
 
 const PCM_WORKLET_URL = '/pcmWorklet.js';
 
@@ -23,7 +24,6 @@ const MENU_WINDOW = 240;
 const PANEL_ANCHOR = { x: 190, y: 520 };
 const ORB_POSITION_KEY = 'jarvisOrbPosition';
 
-type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'panel-open' | 'offline';
 type WindowMode = 'orb' | 'menu' | 'panel';
 const ENDPOINT_RMS_THRESHOLD = 500;
 const ENDPOINT_SILENCE_MS = 900;

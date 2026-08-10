@@ -3,9 +3,10 @@ import * as THREE from 'three';
 import { useOrbWarmth } from '../orb/useOrbWarmth';
 import { useMicroMovements } from '../orb/useMicroMovements';
 import { useParticleMemory } from '../orb/useParticleMemory';
+import type { OrbState } from '../orb/OrbEngine';
 
 interface VoiceOrbProps {
-  state: 'idle' | 'listening' | 'thinking' | 'speaking' | 'offline';
+  state: OrbState;
   analysers: AnalyserNode[];
   isError?: boolean;
   isPanelOpen?: boolean;
