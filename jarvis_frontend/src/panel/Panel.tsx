@@ -82,6 +82,7 @@ const Panel: React.FC<PanelProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragPosition, setDragPosition] = useState<{ x: number; y: number } | null>(null);
+  const [savedPanelPosition, setSavedPanelPosition] = useState<{ x: number; y: number } | null>(null);
   const [graceTimer, setGraceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -93,7 +94,10 @@ const Panel: React.FC<PanelProps> = ({
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
-        JSON.parse(stored);
+        const parsed = JSON.parse(stored);
+        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
+          setSavedPanelPosition({ x: parsed.x, y: parsed.y });
+        }
       }
     } catch {
       // ignore
@@ -134,8 +138,17 @@ const Panel: React.FC<PanelProps> = ({
     const handleUp = () => {
       isDraggingRef.current = false;
       setIsDragging(false);
+      const current = dragPositionRef.current;
       setDragPosition(null);
       dragPositionRef.current = null;
+      if (current && typeof current.x === 'number' && typeof current.y === 'number') {
+        setSavedPanelPosition(current);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+        } catch {
+          // ignore storage errors
+        }
+      }
     };
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);
@@ -197,8 +210,8 @@ const Panel: React.FC<PanelProps> = ({
         ref={panelRef}
         className={`panel ${className || ''} ${isDragging ? 'dragging' : ''} ${fillWindow ? 'panel-fill' : ''}`}
         style={{
-          left: fillWindow ? 0 : (dragPosition ?? position).x,
-          top: fillWindow ? 0 : (dragPosition ?? position).y,
+          left: fillWindow ? 0 : (dragPosition ?? savedPanelPosition ?? position).x,
+          top: fillWindow ? 0 : (dragPosition ?? savedPanelPosition ?? position).y,
           width: fillWindow ? '100%' : 'var(--panel-width)',
           maxWidth: fillWindow ? 'none' : 'var(--panel-max-width)',
           maxHeight: fillWindow ? 'none' : 'var(--panel-max-height)',
