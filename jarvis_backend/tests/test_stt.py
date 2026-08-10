@@ -159,3 +159,61 @@ def test_stream_abandon_does_not_raise():
         stream.abandon()
         stream.abandon()  # idempotent
     assert True
+
+
+def test_wake_word_detector_fires_on_phrase():
+    stt = SpeechToTextModule(model_dir="/nonexistent/path")
+    detected: list[str] = []
+
+    rec = MagicMock()
+    # After the phrase fires, the decoder is Reset() and partials go empty
+    # until fresh speech arrives.
+    rec.PartialResult.side_effect = [
+        '{"partial": "computer"}',
+        '{"partial": ""}',
+        '{"partial": ""}',
+    ]
+
+    with (
+        patch.object(stt, "_ensure_loaded", return_value=True),
+        patch("modules.stt.KaldiRecognizer", return_value=rec),
+    ):
+        detector = stt.wake_word(on_detected=detected.append, phrase="computer")
+        detector.feed(b"\x00" * 3200)
+        detector.feed(b"\x00" * 3200)
+        detector.feed(b"\x00" * 3200)
+        detector.close()
+
+    assert detected == ["computer"]
+    rec.Reset.assert_called()
+
+
+def test_wake_word_detector_ignores_unrelated_speech():
+    stt = SpeechToTextModule(model_dir="/nonexistent/path")
+    detected: list[str] = []
+
+    rec = MagicMock()
+    rec.PartialResult.return_value = '{"partial": "[unk] open the weather app [unk]" }'
+
+    with (
+        patch.object(stt, "_ensure_loaded", return_value=True),
+        patch("modules.stt.KaldiRecognizer", return_value=rec),
+    ):
+        detector = stt.wake_word(on_detected=detected.append, phrase="computer")
+        detector.feed(b"\x00" * 3200)
+        detector.feed(b"\x00" * 3200)
+        detector.close()
+
+    assert detected == []
+
+
+def test_wake_word_detector_noop_without_model():
+    stt = SpeechToTextModule(model_dir="/nonexistent/path")
+    detected: list[str] = []
+
+    with patch.object(stt, "_ensure_loaded", return_value=False):
+        detector = stt.wake_word(on_detected=detected.append, phrase="computer")
+        detector.feed(b"\x00" * 3200)
+        detector.close()
+
+    assert detected == []

@@ -4,6 +4,7 @@ Security helpers and singletons now live in :mod:`routes.state`.  This module
 re-exports them so existing imports (`from routes.deps import ...`) keep working.
 """
 
+from modules.audit import clear_audit, get_recent_audit, log_action
 from routes.state import (
     ALLOWED_SYSTEM_COMMANDS,
     ENV_FILE_PATH,
@@ -64,4 +65,7 @@ __all__ = [
     "require_document_confirmation",
     "vision",
     "vault",
+    "log_action",
+    "get_recent_audit",
+    "clear_audit",
 ]

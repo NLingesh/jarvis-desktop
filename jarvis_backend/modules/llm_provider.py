@@ -27,14 +27,15 @@ JARVIS_SYSTEM_PROMPT = (
 class LLMProvider:
     """Abstracts LLM provider implementation.
 
-    Supports two modes:
-    - 'anthropic' (delegates to existing ClaudeAPI when available)
+    Supported providers:
+    - 'anthropic' (delegates to ClaudeAPI when available)
     - 'mistral' (HTTP client using MISTRAL_API_KEY)
+    - 'ollama' (local Ollama server)
     """
 
     def __init__(self):
         self.provider = os.getenv("LLM_PROVIDER", "mistral").lower()
-        self.model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+        self.model = os.getenv("LLM_MODEL", os.getenv("MISTRAL_MODEL", "mistral-small-latest"))
 
         if self.provider == "anthropic":
             try:
@@ -44,14 +45,18 @@ class LLMProvider:
             except Exception as e:
                 logger.error("Failed to initialize Anthropic client: %s", e)
                 self.client = None
+        elif self.provider == "ollama":
+            self.ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+            self.model = os.getenv("LLM_MODEL", "llama3.1")
+            logger.info("Using Ollama provider at %s with model %s", self.ollama_url, self.model)
         elif self.provider == "mistral":
             self.api_key = os.getenv("MISTRAL_API_KEY")
             self.api_url = os.getenv("MISTRAL_API_URL", "https://api.mistral.ai")
             if self.api_key and self.api_key.startswith("nvapi-"):
                 if not os.getenv("MISTRAL_API_URL"):
-                    # NVIDIA-hosted models use the NVIDIA inference API base
-                    # (the code appends /v1/chat/completions to this base URL)
                     self.api_url = "https://integrate.api.nvidia.com"
+                if not os.getenv("MISTRAL_MODEL"):
+                    self.model = "meta/llama-3.1-8b-instruct"
                 logger.info("Detected NVIDIA API key; using NVIDIA inference API")
             if not self.api_key:
                 logger.warning("MISTRAL_API_KEY not set; LLM calls will fail until provided")
@@ -101,6 +106,11 @@ class LLMProvider:
             if not self.client:
                 return "Anthropic client unavailable"
             return await self.client.get_response(
+                user_message, conversation_history, context, memory_results
+            )
+
+        if self.provider == "ollama":
+            return await self._ollama_get_response(
                 user_message, conversation_history, context, memory_results
             )
 
@@ -209,7 +219,13 @@ class LLMProvider:
             if getattr(self, "api_key", None):
                 headers["Authorization"] = f"Bearer {self.api_key}"
 
-            payload = {"model": self.model, "messages": messages, "stream": True}
+            # Try the configured model first, then fall back to a known-good
+            # NVIDIA model (e.g. if the configured endpoint hangs).
+            models = [self.model]
+            if self.model != "meta/llama-3.1-8b-instruct" and getattr(
+                self, "api_key", ""
+            ).startswith("nvapi-"):
+                models.append("meta/llama-3.1-8b-instruct")
 
             url_options = [
                 f"{self.api_url.rstrip('/')}/v1/chat/completions",
@@ -217,51 +233,120 @@ class LLMProvider:
                 f"{self.api_url.rstrip('/')}/v1/streams",
             ]
 
-            async with httpx.AsyncClient(timeout=None) as client:
-                for url in url_options:
-                    try:
-                        async with client.stream("POST", url, headers=headers, json=payload) as r:
-                            if r.status_code >= 400:
-                                continue
-
-                            async for line in r.aiter_lines():
-                                if not line:
-                                    continue
-                                if line.startswith("data: "):
-                                    line = line[len("data: ") :]
-                                line = line.strip()
-                                if line in ("[DONE]", "DONE"):
-                                    return
-                                try:
-                                    payload_obj = json.loads(line)
-                                except Exception:
-                                    yield line
+            # Bounded so a hanging model can't block the voice round trip forever.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=20.0)) as client:
+                for model in models:
+                    payload = {"model": model, "messages": messages, "stream": True}
+                    streamed = False
+                    yielded = False
+                    for url in url_options:
+                        try:
+                            async with client.stream(
+                                "POST", url, headers=headers, json=payload
+                            ) as r:
+                                if r.status_code >= 400:
                                     continue
 
-                                text_chunk = None
-                                with contextlib.suppress(Exception):
-                                    text_chunk = payload_obj["outputs"][0]["content"][0]["text"]
-                                if not text_chunk:
-                                    with contextlib.suppress(Exception):
-                                        text_chunk = payload_obj["choices"][0]["delta"]["content"]
-                                if not text_chunk:
-                                    with contextlib.suppress(Exception):
-                                        text_chunk = payload_obj["choices"][0]["text"]
-                                if not text_chunk:
-                                    with contextlib.suppress(Exception):
-                                        text_chunk = payload_obj["generated_text"]
+                                async for line in r.aiter_lines():
+                                    if not line:
+                                        continue
+                                    if line.startswith("data: "):
+                                        line = line[len("data: ") :]
+                                    line = line.strip()
+                                    if line in ("[DONE]", "DONE"):
+                                        streamed = True
+                                        break
+                                    try:
+                                        payload_obj = json.loads(line)
+                                    except Exception:
+                                        yield line
+                                        continue
 
-                                if text_chunk:
-                                    yield text_chunk
+                                    text_chunk = None
+                                    with contextlib.suppress(Exception):
+                                        text_chunk = payload_obj["outputs"][0]["content"][0]["text"]
+                                    if not text_chunk:
+                                        with contextlib.suppress(Exception):
+                                            text_chunk = payload_obj["choices"][0]["delta"][
+                                                "content"
+                                            ]
+                                    if not text_chunk:
+                                        with contextlib.suppress(Exception):
+                                            text_chunk = payload_obj["choices"][0]["text"]
+                                    if not text_chunk:
+                                        with contextlib.suppress(Exception):
+                                            text_chunk = payload_obj["generated_text"]
 
+                                    if text_chunk:
+                                        yielded = True
+                                        yield text_chunk
+
+                                streamed = True
+                                break
+                        except Exception:
+                            if yielded:
+                                logger.warning("LLM stream dropped mid-response; stopping")
+                                return
+                            await asyncio.sleep(0.1)
+                            continue
+                    if streamed:
                         return
-                    except Exception:
-                        await asyncio.sleep(0.1)
-                        continue
+
+        if self.provider == "ollama":
+            messages = self._build_messages(
+                user_message, conversation_history, context, memory_results
+            )
+            payload = {"model": self.model, "messages": messages, "stream": True}
+            try:
+                async with (
+                    httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=20.0)) as client,
+                    client.stream(
+                        "POST",
+                        f"{self.ollama_url}/api/chat",
+                        json=payload,
+                    ) as r,
+                ):
+                    r.raise_for_status()
+                    async for line in r.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            payload_obj = json.loads(line)
+                            text_chunk = payload_obj.get("message", {}).get("content", "")
+                            if text_chunk:
+                                yield text_chunk
+                        except Exception:
+                            continue
+                    return
+            except Exception as e:
+                logger.error("Ollama stream failed: %s", e)
+                return
 
         # fallback: non-streaming
         full = await self.get_response(user_message, conversation_history, context, memory_results)
         yield full
+
+    async def _ollama_get_response(
+        self,
+        user_message: str,
+        conversation_history: list[dict],
+        context: dict | None = None,
+        memory_results: list[dict] | None = None,
+    ) -> str:
+        messages = self._build_messages(user_message, conversation_history, context, memory_results)
+        payload = {"model": self.model, "messages": messages, "stream": False}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=20.0)) as client:
+                r = await client.post(
+                    f"{self.ollama_url}/api/chat",
+                    json=payload,
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data.get("message", {}).get("content", "") or "No response from Ollama"
+        except Exception as e:
+            logger.error("Ollama request failed: %s", e)
+            return f"Ollama request failed: {e}"
 
     async def rerank(self, query: str, passages: list[str], model: str | None = None) -> dict:
         """Call a reranking endpoint (e.g., NVIDIA reranker) and return JSON.

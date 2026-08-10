@@ -92,6 +92,41 @@ supported for backwards compatibility.
 }
 ```
 
+### `wake_start`
+
+Begin continuous wake-word spotting on this connection. The server builds a
+keyphrase recognizer and replies `{ "type": "wake_ready", "phrase" }`. Feed it
+with `wake_chunk` messages (PCM16 mono, 16 kHz by default) until `wake_stop`.
+
+```json
+{
+  "type": "wake_start",
+  "phrase": "computer",
+  "sample_rate": 16000
+}
+```
+
+The phrase **must** be in the bundled Vosk model's vocabulary (e.g. `computer`).
+Proper nouns like "jarvis" are not decodable by the small English model and will
+never trigger.
+
+### `wake_chunk`
+
+A chunk of raw PCM16 little-endian, mono audio (base64) fed to the spotter. On a
+hit the server sends `{ "type": "wake_word", "phrase" }` and resets the decoder.
+
+```json
+{ "type": "wake_chunk", "data": "<base64 of PCM16 LE mono bytes>" }
+```
+
+### `wake_stop`
+
+Stop the spotter on this connection and release its worker thread.
+
+```json
+{ "type": "wake_stop" }
+```
+
 ### `ping`
 
 Heartbeat. The server replies `{ "type": "pong" }`. Send one every ~25 s so the
@@ -184,6 +219,23 @@ Reply to a client `ping` (heartbeat).
 
 ```json
 { "type": "pong" }
+```
+
+### `wake_ready`
+
+Reply to `wake_start`, confirming the spotter is active for the given phrase.
+
+```json
+{ "type": "wake_ready", "phrase": "computer" }
+```
+
+### `wake_word`
+
+A wake-word hit while always-on listening. The client should chime and open the
+main window to begin a voice session.
+
+```json
+{ "type": "wake_word", "phrase": "computer" }
 ```
 
 ### `proactive`

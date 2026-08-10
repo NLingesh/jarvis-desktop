@@ -8,8 +8,8 @@ from fastapi.testclient import TestClient
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from managers.memory_manager import MemoryManager
 from modules.auth import AuthMiddleware, AuthService, hash_password, verify_password
-from modules.memory import MemoryManager
 
 
 def run(mm, coro):

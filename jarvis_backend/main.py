@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -21,29 +22,57 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import FileResponse, Response
 
+from managers.native_audio import list_input_devices
+from managers.native_voice import NativeVoiceSession
 from modules.proactive import ProactiveMonitor
+from routes.adaptive import router as adaptive_router
 from routes.auth import router as auth_router
+from routes.automation import router as automation_router
 from routes.calendar import router as calendar_router
+from routes.code_routes import router as code_router
+from routes.git_routes import router as git_router
 from routes.llm import router as llm_router
 from routes.mail import router as mail_router
 from routes.memory import router as memory_router
+from routes.models import router as models_router
 from routes.notes import router as notes_router
+from routes.performance import router as performance_router
+from routes.plugins import router as plugins_router
+from routes.proactive_ai import router as proactive_ai_router
+from routes.projects import router as projects_router
+from routes.search import router as search_router
+from routes.security import router as security_router
 from routes.settings import router as settings_router
 from routes.state import (
+    audio_manager,
     auth_service,
     calendar,
     handle_user_input,
+    llm,
     mail_sessions,
     memory_manager,
+    model_manager,
+    plugin_registry,
     stream_speech_to_socket,
     stt,
+    stt_manager,
+    system_actions,
+    task_manager,
+    tts,
+    tts_manager,
     validate_ws_token,
     vault,
+    vision_manager,
+    voice_manager,
+    workflow_manager,
 )
 from routes.stt import router as stt_router
 from routes.system import router as system_router
+from routes.tasks import router as tasks_router
+from routes.tools import router as tools_router
 from routes.vault import router as vault_router
 from routes.vision import router as vision_router
+from routes.voice import router as voice_router
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +134,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class PerformanceTrackingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        try:
+            from routes.state import performance_manager
+
+            performance_manager.record_request(request.url.path, duration_ms, response.status_code)
+        except Exception:
+            pass
+        return response
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -144,14 +187,56 @@ async def lifespan(app: FastAPI):
     proactive = ProactiveMonitor(
         calendar=calendar,
         mail_sessions=mail_sessions,
+        system_actions=system_actions,
+        memory_manager=memory_manager,
         deliver=_deliver_proactive,
     )
     if not os.getenv("JARVIS_SKIP_PROACTIVE"):
         await proactive.start()
 
+    async def _deliver_automation(text: str) -> None:
+        sockets = list(_connected_sockets)
+        for socket in sockets:
+            with contextlib.suppress(Exception):
+                await socket.send_json({"type": "automation", "text": text})
+
+    task_manager.deliver = _deliver_automation
+    workflow_manager.deliver = _deliver_automation
+
+    await task_manager.start()
+    await workflow_manager.start()
+
+    from plugins.builtin.skills import (
+        CalendarPlugin,
+        EmailPlugin,
+        NotesPlugin,
+        SystemPlugin,
+        TranslatePlugin,
+        WeatherPlugin,
+        WebSearchPlugin,
+    )
+
+    builtin_plugins = [
+        CalendarPlugin,
+        EmailPlugin,
+        WebSearchPlugin,
+        WeatherPlugin,
+        TranslatePlugin,
+        SystemPlugin,
+        NotesPlugin,
+    ]
+    for plugin_cls in builtin_plugins:
+        try:
+            await plugin_registry.load_plugin(plugin_cls)
+        except Exception as exc:
+            logger.error("Failed to load builtin plugin %s: %s", plugin_cls.__name__, exc)
+
     yield
     logger.info("JARVIS Backend shutting down...")
     await proactive.stop()
+    await task_manager.stop()
+    await workflow_manager.stop()
+    await plugin_registry.shutdown()
     await memory_manager.close()
     await vault.close()
 
@@ -170,10 +255,25 @@ app.include_router(stt_router)
 app.include_router(settings_router)
 app.include_router(vision_router)
 app.include_router(vault_router)
+app.include_router(tools_router)
+app.include_router(search_router)
+app.include_router(voice_router)
+app.include_router(automation_router)
+app.include_router(adaptive_router)
+app.include_router(proactive_ai_router)
+app.include_router(security_router)
+app.include_router(performance_router)
+app.include_router(projects_router)
+app.include_router(git_router)
+app.include_router(code_router)
+app.include_router(models_router)
+app.include_router(tasks_router)
+app.include_router(plugins_router)
 
 # Middleware (order matters: CSP / rate-limit wrap CORS)
 app.add_middleware(CSPMiddleware)
 app.add_middleware(RateLimitMiddleware, max_requests=60, window_seconds=60)
+app.add_middleware(PerformanceTrackingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -190,7 +290,45 @@ if auth_service.enabled:
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "JARVIS Backend"}
+    return {
+        "status": "healthy",
+        "service": "JARVIS Backend",
+        "stt": stt.available,
+        "ws_connections": len(_connected_sockets),
+        "managers": {
+            "audio": audio_manager.diagnostics(),
+            "stt": stt_manager.diagnostics(),
+            "tts": tts_manager.diagnostics(),
+            "voice": voice_manager.diagnostics(),
+            "model": model_manager.diagnostics(),
+            "vision": vision_manager.diagnostics(),
+        },
+    }
+
+
+@app.get("/api/voice/diagnostics")
+async def voice_diagnostics():
+    """Structured pipeline health for startup checks and debugging.
+
+    The frontend calls this at startup to report whether the backend,
+    speech recognition, and TTS are ready, and to surface actionable
+    guidance instead of generic "Failed to fetch" / "Couldn't listen" errors.
+    """
+    return {
+        "backend": {"status": "ok", "service": "JARVIS Backend"},
+        "ws_connections": len(_connected_sockets),
+        "stt": stt.diagnostics(),
+        "tts": tts.diagnostics(),
+        "llm": {
+            "provider": getattr(llm, "provider", None),
+            "model": getattr(llm, "model", None),
+            "configured": bool(
+                getattr(llm, "api_key", None)
+                or getattr(getattr(llm, "client", None), "api_key", None)
+                or getattr(llm, "client", None) is not None
+            ),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -202,23 +340,45 @@ STT_SEMAPHORE = asyncio.Semaphore(4)
 WS_IDLE_TIMEOUT = 90
 
 
-async def _finalize_audio_stream(stream, websocket) -> str:
+async def _finalize_audio_stream(stream, websocket, voice_uid: str) -> str:
     """Finalize a streaming recognizer and return its transcription."""
     try:
         async with STT_SEMAPHORE:
             user_input = await asyncio.to_thread(stream.finish)
-    except Exception as e:
-        logger.error("STT failed on websocket: %s", e)
+    except TimeoutError:
+        logger.error("[voice:%s] STT finish timed out", voice_uid)
         with contextlib.suppress(Exception):
             await websocket.send_json(
-                {"type": "error", "message": f"Speech recognition failed: {e}"}
+                {
+                    "type": "error",
+                    "message": "Speech recognition timed out. Please try again.",
+                }
+            )
+        return ""
+    except Exception as e:
+        message = str(e)
+        logger.error("[voice:%s] STT failed: %s", voice_uid, message)
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "message": f"Speech recognition failed: {message}"}
             )
         return ""
     if not user_input:
-        with contextlib.suppress(Exception):
-            await websocket.send_json(
-                {"type": "error", "message": "I could not hear anything. Please try again."}
+        if not stt.available:
+            detail = (
+                "Speech recognition engine is not ready. Install a Vosk model via "
+                "scripts/download-vosk-model.sh, or set OPENAI_API_KEY for cloud fallback."
             )
+        elif stt.available and not stt.has_cloud_fallback:
+            detail = (
+                "I heard audio but could not transcribe it. Vosk returned no text and no "
+                "cloud fallback (OPENAI_API_KEY) is configured."
+            )
+        else:
+            detail = "I could not hear any speech. Please speak again."
+        logger.info("[voice:%s] STT returned no text (%s)", voice_uid, detail)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "message": detail})
     return user_input
 
 
@@ -227,9 +387,13 @@ async def websocket_endpoint(websocket: WebSocket):
     await validate_ws_token(websocket)
     await websocket.accept()
     _connected_sockets.add(websocket)
+    voice_uid = uuid.uuid4().hex[:8]
+    logger.info("[voice:%s] connection open (peer=%s)", voice_uid, websocket.client)
     session_id = await memory_manager.create_session()
     pending_stream = None
+    wake_detector = None
     loop = asyncio.get_running_loop()
+    audio_bytes = 0
 
     def send_partial(text: str) -> None:
         """Deliver a live STT hypothesis from the recognizer thread to the socket."""
@@ -237,6 +401,15 @@ async def websocket_endpoint(websocket: WebSocket):
         async def _send() -> None:
             with contextlib.suppress(Exception):
                 await websocket.send_json({"type": "transcript", "text": text})
+
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
+
+    def send_wake_word(phrase: str) -> None:
+        """Deliver a wake-word hit from the spotter thread to the socket."""
+
+        async def _send() -> None:
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "wake_word", "phrase": phrase})
 
         loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
@@ -251,13 +424,47 @@ async def websocket_endpoint(websocket: WebSocket):
                 user_input = data.get("content", "").strip()
                 if not user_input:
                     continue
-                await handle_user_input(user_input, session_id, websocket)
+                logger.info("[voice:%s] text input (%d chars)", voice_uid, len(user_input))
+                await handle_user_input(user_input, session_id, websocket, voice_uid)
+            elif msg_type == "wake_start":
+                if wake_detector is not None:
+                    wake_detector.close()
+                phrase = (data.get("phrase") or os.getenv("WAKE_WORD", "computer")).strip()
+                sample_rate = int(data.get("sample_rate") or 16000)
+                logger.info(
+                    "[voice:%s] wake_start phrase=%r sample_rate=%d", voice_uid, phrase, sample_rate
+                )
+                wake_detector = stt.wake_word(
+                    on_detected=send_wake_word, phrase=phrase, sample_rate=sample_rate
+                )
+                await websocket.send_json({"type": "wake_ready", "phrase": phrase})
+            elif msg_type == "wake_chunk":
+                if wake_detector is None:
+                    await websocket.send_json(
+                        {"type": "error", "message": "wake_start must precede wake_chunk"}
+                    )
+                    continue
+                chunk_b64 = data.get("data")
+                if not chunk_b64:
+                    continue
+                try:
+                    pcm = base64.b64decode(chunk_b64)
+                except Exception as e:
+                    logger.warning("[voice:%s] invalid wake chunk: %s", voice_uid, e)
+                    continue
+                wake_detector.feed(pcm)
+            elif msg_type == "wake_stop":
+                if wake_detector is not None:
+                    wake_detector.close()
+                    wake_detector = None
             elif msg_type == "audio_start":
                 # A new utterance while one is still open: finalize the old one first.
                 if pending_stream is not None:
-                    await _finalize_audio_stream(pending_stream, websocket)
+                    await _finalize_audio_stream(pending_stream, websocket, voice_uid)
                 sample_rate = int(data.get("sample_rate") or 16000)
                 pending_stream = stt.stream(sample_rate, on_partial=send_partial)
+                audio_bytes = 0
+                logger.info("[voice:%s] audio_start sample_rate=%d", voice_uid, sample_rate)
                 await websocket.send_json({"type": "status", "status": "transcribing"})
             elif msg_type == "audio_chunk":
                 if pending_stream is None:
@@ -271,9 +478,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     pcm = base64.b64decode(chunk_b64)
                 except Exception as e:
-                    logger.warning("Invalid audio chunk: %s", e)
+                    logger.warning("[voice:%s] invalid audio chunk: %s", voice_uid, e)
                     await websocket.send_json({"type": "error", "message": "Invalid audio chunk"})
                     continue
+                audio_bytes += len(pcm)
                 pending_stream.feed(pcm)
             elif msg_type == "audio_end":
                 if pending_stream is None:
@@ -281,12 +489,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         {"type": "error", "message": "audio_end without audio_start"}
                     )
                     continue
-                user_input = await _finalize_audio_stream(pending_stream, websocket)
+                logger.info(
+                    "[voice:%s] audio_end received %.1f KB",
+                    voice_uid,
+                    audio_bytes / 1024,
+                )
+                user_input = await _finalize_audio_stream(pending_stream, websocket, voice_uid)
                 pending_stream = None
                 if not user_input:
                     continue
-                logger.info("User (voice): %s", user_input)
-                await handle_user_input(user_input, session_id, websocket)
+                logger.info("[voice:%s] User (voice): %s", voice_uid, user_input)
+                await handle_user_input(user_input, session_id, websocket, voice_uid)
             elif msg_type == "audio":
                 # Legacy whole-blob payload (backwards compatible).
                 audio_base64 = data.get("audio_base64") or data.get("audio")
@@ -303,7 +516,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     async with STT_SEMAPHORE:
                         user_input = await asyncio.to_thread(stt.transcribe_base64, audio_base64)
                 except Exception as e:
-                    logger.error("STT failed on websocket: %s", e)
+                    logger.error("[voice:%s] STT failed on websocket: %s", voice_uid, e)
                     await websocket.send_json(
                         {
                             "type": "error",
@@ -315,19 +528,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json(
                         {
                             "type": "error",
-                            "message": "I could not hear anything. Please try again.",
+                            "message": "I could not hear any speech. Please try again.",
                         }
                     )
                     continue
-                logger.info("User (voice): %s", user_input)
-                await handle_user_input(user_input, session_id, websocket)
+                logger.info("[voice:%s] User (voice): %s", voice_uid, user_input)
+                await handle_user_input(user_input, session_id, websocket, voice_uid)
 
     except TimeoutError:
-        logger.info("WebSocket idle timeout, closing session %s", session_id)
+        logger.info("[voice:%s] idle timeout, closing session %s", voice_uid, session_id)
     except WebSocketDisconnect:
-        logger.info("Client disconnected, session %s saved", session_id)
+        logger.info("[voice:%s] client disconnected, session %s saved", voice_uid, session_id)
     except Exception as e:
-        logger.error("WebSocket error: %s", e)
+        logger.error("[voice:%s] websocket error: %s", voice_uid, e)
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(e)})
     finally:
@@ -335,6 +548,189 @@ async def websocket_endpoint(websocket: WebSocket):
         if pending_stream is not None:
             # The utterance never finished cleanly; abandon the worker thread.
             pending_stream.abandon()
+        if wake_detector is not None:
+            wake_detector.close()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — native voice (backend-owned microphone)
+# ---------------------------------------------------------------------------
+NATIVE_VOICE_TIMEOUT = 120
+
+
+async def _native_transcribe(session, pcm: bytes, websocket, voice_uid: str) -> str:
+    """Transcribe a captured utterance using the STT manager."""
+    if not pcm:
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "message": "I didn't catch any audio. Please speak again."}
+            )
+        return ""
+    try:
+        async with STT_SEMAPHORE:
+            user_input = await asyncio.to_thread(stt_manager.transcribe_pcm16, pcm, 16000)
+    except Exception as e:
+        logger.error("[voice:%s] native STT failed: %s", voice_uid, e)
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "message": f"Speech recognition failed: {e}"}
+            )
+        return ""
+    if not user_input:
+        detail = (
+            "I heard audio but could not transcribe it. If this keeps happening, "
+            "check that the STT model is installed and the microphone gain is up."
+        )
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "message": detail})
+    return user_input
+
+
+@app.websocket("/ws/voice/native")
+async def native_voice_endpoint(websocket: WebSocket):
+    """Backend-owned microphone voice endpoint.
+
+    The backend captures audio directly from the local microphone (sounddevice)
+    so the browser never touches getUserMedia.  Commands:
+
+    * ``{"type": "connect"}``            — open the mic, enter READY
+    * ``{"type": "start_listening", "mode": "ptt"|"tap"|"hands_free"}``
+    * ``{"type": "stop_listening"}``      — PTT release / tap again
+    * ``{"type": "cancel"}``              — discard current utterance
+    * ``{"type": "set_device", "device": int|str}``
+    * ``{"type": "get_devices"}``
+    * ``{"type": "mic_test_start"}`` / ``{"type": "mic_test_stop"}``
+    * ``{"type": "ping"}``
+
+    Server events: ``state``, ``level``, ``devices``, then the standard
+    transcript/response/audio_segment_* flow from ``handle_user_input``.
+    """
+    await validate_ws_token(websocket)
+    await websocket.accept()
+    voice_uid = uuid.uuid4().hex[:8]
+    logger.info("[voice:%s] native connection open (peer=%s)", voice_uid, websocket.client)
+    session_id = await memory_manager.create_session()
+    loop = asyncio.get_running_loop()
+    session = None
+    mic_testing = False
+
+    def _emit_state(state: str, detail: str) -> None:
+        async def _send() -> None:
+            with contextlib.suppress(Exception):
+                await websocket.send_json(
+                    {"type": "state", "state": state, "detail": detail or None}
+                )
+
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
+
+    def _emit_level(level: dict) -> None:
+        async def _send() -> None:
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "level", **level})
+
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
+
+    def _on_utterance(pcm: bytes) -> None:
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_process_utterance(pcm)))
+
+    async def _process_utterance(pcm: bytes) -> None:
+        user_input = await _native_transcribe(session, pcm, websocket, voice_uid)
+        if not user_input:
+            _emit_state("IDLE", "no speech detected")
+            return
+        logger.info("[voice:%s] User (native voice): %s", voice_uid, user_input)
+        _emit_state("PROCESSING", "stt complete")
+        await handle_user_input(user_input, session_id, websocket, voice_uid)
+        _emit_state("IDLE", "utterance complete")
+
+    try:
+        while True:
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=NATIVE_VOICE_TIMEOUT)
+            msg_type = data.get("type")
+
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif msg_type == "connect":
+                if session is None:
+                    session = NativeVoiceSession(
+                        device=data.get("device"),
+                        on_state=_emit_state,
+                        on_level=_emit_level,
+                        on_utterance=_on_utterance,
+                    )
+                else:
+                    session.set_device(data.get("device") or session._device)
+                await websocket.send_json({"type": "devices", "devices": list_input_devices()})
+                if not session.connect():
+                    await websocket.send_json(
+                        {"type": "error", "message": session.diagnostics().get("error")}
+                    )
+            elif msg_type == "get_devices":
+                await websocket.send_json({"type": "devices", "devices": list_input_devices()})
+            elif msg_type == "set_device":
+                if session is None:
+                    session = NativeVoiceSession(
+                        device=data.get("device"),
+                        on_state=_emit_state,
+                        on_level=_emit_level,
+                        on_utterance=_on_utterance,
+                    )
+                result = session.set_device(data.get("device"))
+                await websocket.send_json({"type": "devices", **result})
+            elif msg_type == "start_listening":
+                if session is None:
+                    session = NativeVoiceSession(
+                        device=data.get("device"),
+                        on_state=_emit_state,
+                        on_level=_emit_level,
+                        on_utterance=_on_utterance,
+                    )
+                mode = data.get("mode", "ptt")
+                ok = session.start_listening(mode)
+                if not ok:
+                    await websocket.send_json(
+                        {"type": "error", "message": session.diagnostics().get("error")}
+                    )
+            elif msg_type == "stop_listening":
+                if session is not None:
+                    pcm = session.stop_listening()
+                    if session._mode in ("ptt", "tap") and pcm:
+                        loop.call_soon_threadsafe(
+                            lambda pcm=pcm: asyncio.create_task(_process_utterance(pcm))
+                        )
+            elif msg_type == "cancel":
+                if session is not None:
+                    session.cancel()
+            elif msg_type == "mic_test_start":
+                if session is None:
+                    session = NativeVoiceSession(
+                        device=data.get("device"),
+                        on_state=_emit_state,
+                        on_level=_emit_level,
+                        on_utterance=_on_utterance,
+                    )
+                mic_testing = session.mic_test()
+                if mic_testing:
+                    await websocket.send_json({"type": "mic_test", "status": "started"})
+            elif msg_type == "mic_test_stop":
+                mic_testing = False
+                if session is not None:
+                    session.disconnect()
+                await websocket.send_json({"type": "mic_test", "status": "stopped"})
+
+    except TimeoutError:
+        logger.info("[voice:%s] native idle timeout, closing session %s", voice_uid, session_id)
+    except WebSocketDisconnect:
+        logger.info(
+            "[voice:%s] native client disconnected, session %s saved", voice_uid, session_id
+        )
+    except Exception as e:
+        logger.error("[voice:%s] native websocket error: %s", voice_uid, e)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "error", "message": str(e)})
+    finally:
+        if session is not None:
+            session.disconnect()
 
 
 # ---------------------------------------------------------------------------

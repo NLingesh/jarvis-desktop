@@ -1,0 +1,140 @@
+.code-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 12px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.code-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.code-tab {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.code-tab.active {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.code-error {
+  font-size: 12px;
+  color: #ff6b6b;
+  text-align: center;
+  padding: 8px;
+}
+
+.code-search,
+.code-explain {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.search-bar,
+.explain-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.search-input,
+.explain-input,
+.search-paths {
+  flex: 1;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.3);
+  color: #fff;
+  font-size: 12px;
+}
+
+.search-btn,
+.explain-btn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.search-btn:disabled,
+.explain-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.search-result {
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.result-file {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+  margin-bottom: 4px;
+}
+
+.result-content {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.code-empty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  text-align: center;
+  padding: 8px;
+}
+
+.explain-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.explain-file {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.explain-snippet {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.explain-text {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1.5;
+}

@@ -1,10 +1,12 @@
 import base64
+import contextlib
 import io
 import json
 import logging
 import os
 import queue
 import threading
+import time
 import wave
 from collections.abc import Callable
 
@@ -47,6 +49,20 @@ class SpeechToTextModule:
     @property
     def available(self) -> bool:
         return VOSK_AVAILABLE and os.path.isdir(self.model_dir)
+
+    def diagnostics(self) -> dict:
+        """Structured status for health checks and the diagnostics endpoint."""
+        return {
+            "engine": "vosk" if VOSK_AVAILABLE else None,
+            "engine_import_error": (
+                None if VOSK_AVAILABLE else "vosk package not installed or import failed"
+            ),
+            "model_installed": os.path.isdir(self.model_dir),
+            "model_loaded": self._model is not None,
+            "model_dir": self.model_dir,
+            "cloud_fallback": self.has_cloud_fallback,
+            "ready": self.available,
+        }
 
     def _ensure_loaded(self):
         if self._model is not None:
@@ -110,6 +126,24 @@ class SpeechToTextModule:
             logger.error(f"Cloud STT failed: {e}")
             raise RuntimeError(f"Cloud speech recognition failed: {e}") from e
 
+    def transcribe_with_retry(self, wav_bytes: bytes, retries: int = 2) -> str:
+        """Transcribe with automatic retry on transient cloud failures."""
+        last_error = None
+        for attempt in range(retries):
+            try:
+                return self.transcribe_wav(wav_bytes)
+            except RuntimeError as e:
+                last_error = e
+                if "cloud" in str(e).lower() and attempt < retries - 1:
+                    wait = min(1.0 * (2**attempt), 5.0)
+                    logger.warning(
+                        f"Cloud STT attempt {attempt + 1} failed, retrying in {wait}s: {e}"
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        raise last_error  # type: ignore[misc]
+
     def transcribe_base64(self, audio_base64: str) -> str:
         """Transcribe audio given as a base64 WAV payload."""
         raw = base64.b64decode(audio_base64)
@@ -132,6 +166,20 @@ class SpeechToTextModule:
         hypothesis whenever it changes (may be called many times per utterance).
         """
         return _StreamingRecognizer(self, sample_rate, on_partial)
+
+    def wake_word(
+        self,
+        on_detected: "Callable[[str], None]",
+        phrase: str = "computer",
+        sample_rate: int = 16000,
+    ) -> "_WakeWordDetector":
+        """Create a continuous keyphrase spotter for always-on listening.
+
+        ``on_detected`` is invoked from the worker thread with the detected
+        phrase. The phrase must be in the Vosk model's vocabulary (e.g.
+        "computer"); words it cannot decode (like proper names) are ignored.
+        """
+        return _WakeWordDetector(self, on_detected, phrase, sample_rate)
 
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -233,3 +281,60 @@ class _StreamingRecognizer:
         if self._error is not None:
             raise self._error
         return self._result
+
+
+class _WakeWordDetector:
+    """Continuous keyphrase spotter fed by PCM16 chunks.
+
+    Runs a Vosk recognizer constrained by a ``[phrase, "[unk]"]`` grammar on a
+    worker thread. Whenever the phrase appears in a partial hypothesis it resets
+    the decoder and fires ``on_detected``. ``[unk]`` lets arbitrary surrounding
+    speech pass through so the phrase is caught mid-conversation.
+    """
+
+    def __init__(
+        self,
+        stt_module: "SpeechToTextModule",
+        on_detected: "Callable[[str], None]",
+        phrase: str = "computer",
+        sample_rate: int = 16000,
+    ):
+        self._stt = stt_module
+        self._on_detected = on_detected
+        self._phrase = phrase
+        self._sample_rate = sample_rate
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        recognizer = None
+        if self._stt._ensure_loaded():
+            grammar = json.dumps([self._phrase, "[unk]"])
+            recognizer = KaldiRecognizer(self._stt._model, self._sample_rate, grammar)
+        while True:
+            chunk = self._queue.get()
+            if chunk is None:
+                break
+            if recognizer is None:
+                continue
+            try:
+                recognizer.AcceptWaveform(chunk)
+                partial = json.loads(recognizer.PartialResult()).get("partial", "")
+            except Exception:
+                logger.warning("Wake-word recognizer error", exc_info=True)
+                continue
+            words = [w for w in partial.split() if w != "[unk]"]
+            if self._phrase in words:
+                recognizer.Reset()
+                with contextlib.suppress(Exception):
+                    self._on_detected(self._phrase)
+
+    def feed(self, pcm: bytes) -> None:
+        """Push a PCM16 chunk to the spotter worker (non-blocking)."""
+        self._queue.put(pcm)
+
+    def close(self) -> None:
+        """Stop the worker thread."""
+        self._queue.put(None)
+        self._thread.join(timeout=2.0)

@@ -1,13 +1,49 @@
-import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import './App.css';
-import VoiceOrb from './components/VoiceOrb';
-import Onboarding from './components/Onboarding';
+import OrbEngine from './orb/OrbEngine';
+import { Panel, PanelView } from './panel';
 import { computeRms, uint8ToBase64 } from './audioStream';
+import {
+  checkBackendHealth,
+  checkVoiceDiagnostics,
+  classifyError,
+  logVoice,
+  retryWithBackoff,
+  withTimeout,
+  type VoiceStage,
+} from './voiceDiagnostics';
+import { VoiceState, transition, type VoiceStateContext } from './voiceStateMachine';
+import { ToastProvider } from './components/ToastProvider';
 
 const PCM_WORKLET_URL = '/pcmWorklet.js';
 
-const Settings = lazy(() => import('./components/Settings'));
-const MemoryPage = lazy(() => import('./components/MemoryPage'));
+// Single expanding window geometry (mirrors electron/main.js MODE_SPECS).
+const ORB_WINDOW = 96;
+const MENU_WINDOW = 240;
+const PANEL_ANCHOR = { x: 190, y: 520 };
+const ORB_POSITION_KEY = 'jarvisOrbPosition';
+
+type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'panel-open';
+type WindowMode = 'orb' | 'menu' | 'panel';
+const ENDPOINT_RMS_THRESHOLD = 500;
+const ENDPOINT_SILENCE_MS = 900;
+
+function getElectronAPI(): any {
+  return (window as any).electronAPI;
+}
+
+type SettingsState = {
+  voice: string;
+  volume: number;
+  speed: number;
+  theme: string;
+  enableNotifications: boolean;
+  serverUrl: string;
+  enableWakeWord: boolean;
+  alwaysOnListening: boolean;
+  voiceMode: 'native' | 'browser';
+  nativeMicDevice?: number | string;
+};
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -35,53 +71,22 @@ class ErrorBoundary extends React.Component<
   }
 }
 
-type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking';
-type SheetState = 'hidden' | 'transcript' | 'response';
-
-const ENDPOINT_RMS_THRESHOLD = 500;
-const ENDPOINT_SILENCE_MS = 900;
-const LONG_TASK_MS = 10000;
-
-type SettingsState = {
-  voice: string;
-  volume: number;
-  speed: number;
-  theme: string;
-  enableNotifications: boolean;
-  serverUrl: string;
-  enableWakeWord: boolean;
-  alwaysOnListening: boolean;
-};
-
-type EmailConfig = {
-  email: string;
-  appPassword: string;
-  sessionToken: string | null;
-};
-
 function App() {
-  const [isListening, setIsListening] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [panelView, setPanelView] = useState<PanelView>('chat');
   const [orbState, setOrbState] = useState<OrbState>('idle');
-  const [showSettings, setShowSettings] = useState(false);
-  const [showMemory, setShowMemory] = useState(false);
-  const [showOnboarding, setShowOnboarding] = useState(() => {
-    return localStorage.getItem('jarvisOnboarded') !== 'true';
-  });
-  const [sheetState, setSheetState] = useState<SheetState>('hidden');
-  const [liveTranscript, setLiveTranscript] = useState('');
-  const [assistantText, setAssistantText] = useState('');
-  const [textInput, setTextInput] = useState('');
-  const [isEndpointing, setIsEndpointing] = useState(false);
+  const [windowMode, setWindowMode] = useState<WindowMode>('orb');
+  const [quickActionsOpen, setQuickActionsOpen] = useState(false);
+  const [_voiceMachineState, _setVoiceMachineState] = useState<VoiceState>('idle');
+  const [error, setError] = useState<string | null>(null);
   const [settings, setSettings] = useState<SettingsState>(() => {
     const stored = localStorage.getItem('voiceSettings');
     let parsed: Partial<SettingsState> = {};
     if (stored) {
       try {
         parsed = JSON.parse(stored);
-      } catch (err) {
-        console.warn('Invalid voiceSettings in localStorage', err);
+      } catch {
+        /* ignore */
       }
     }
     return {
@@ -93,13 +98,41 @@ function App() {
       serverUrl: localStorage.getItem('serverUrl') || parsed.serverUrl || 'localhost:8000',
       enableWakeWord: parsed.enableWakeWord ?? true,
       alwaysOnListening: parsed.alwaysOnListening ?? false,
+      voiceMode: parsed.voiceMode ?? 'native',
+      nativeMicDevice: parsed.nativeMicDevice,
     };
   });
-  const [emailConfig, setEmailConfig] = useState<EmailConfig>(() => ({
-    email: localStorage.getItem('emailAddress') || '',
-    appPassword: '',
-    sessionToken: localStorage.getItem('emailSessionToken') || null,
-  }));
+  const [isListening, setIsListening] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isEndpointing, setIsEndpointing] = useState(false);
+  const [_sheetState, setSheetState] = useState<'hidden' | 'transcript' | 'response'>('hidden');
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [assistantText, setAssistantText] = useState('');
+  const liveTranscriptRef = useRef(liveTranscript);
+  liveTranscriptRef.current = liveTranscript;
+  const assistantTextRef = useRef(assistantText);
+  assistantTextRef.current = assistantText;
+  const [showOnboarding, setShowOnboarding] = useState(() => {
+    return localStorage.getItem('jarvisOnboarded') !== 'true';
+  });
+  const [orbPosition, setOrbPosition] = useState<{ x: number; y: number }>(() => {
+    try {
+      const stored = localStorage.getItem(ORB_POSITION_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
+          return { x: parsed.x, y: parsed.y };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
+  });
+  const [rms, setRms] = useState(0);
+  const isElectron = useMemo(() => !!getElectronAPI()?.setWindowMode, []);
+  const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout>>();
 
   const ws = useRef<WebSocket | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
@@ -107,9 +140,9 @@ function App() {
   const audioChunksRef = useRef<string[]>([]);
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingAudioRef = useRef(false);
+  const pendingSegmentsRef = useRef(0);
   const enqueueAudioRef = useRef<(audioBase64: string) => void>(() => {});
   const lastActivityRef = useRef(Date.now());
-  const collapseTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const streamRef = useRef<MediaStream | null>(null);
   const isConnectedRef = useRef(false);
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -127,101 +160,188 @@ function App() {
   const requestStartRef = useRef(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-
-  const getSessionToken = async (): Promise<string | null> => {
-    const api = (window as any).electronAPI;
-    if (!api?.getSessionToken) return null;
-    try {
-      return (await api.getSessionToken()) as string | null;
-    } catch (err) {
-      console.error('Failed to get session token', err);
-      return null;
-    }
-  };
-
-  const resolveWebSocketUrl = (server: string, token: string | null) => {
-    const trimmed = server.replace(/\/*$/, '');
-    let url: string;
-    if (trimmed.startsWith('ws://') || trimmed.startsWith('wss://')) {
-      url = `${trimmed}/ws/voice`;
-    } else if (trimmed.startsWith('http://')) {
-      url = `ws://${trimmed.slice(7)}/ws/voice`;
-    } else if (trimmed.startsWith('https://')) {
-      url = `wss://${trimmed.slice(8)}/ws/voice`;
-    } else {
-      url = `ws://${trimmed}/ws/voice`;
-    }
-    if (token) {
-      url += `?token=${encodeURIComponent(token)}`;
-    }
-    return url;
-  };
-
-  const resetCollapseTimer = useCallback(() => {
-    lastActivityRef.current = Date.now();
-    if (collapseTimerRef.current) {
-      clearTimeout(collapseTimerRef.current);
-    }
-  }, []);
-
-  const tryCollapseSheet = useCallback(() => {
-    if (sheetState === 'hidden') return;
-    if (isProcessing || isListening) return;
-    if (Date.now() - lastActivityRef.current < 4000) return;
-    setSheetState('hidden');
-    setLiveTranscript('');
-    setAssistantText('');
-  }, [sheetState, isProcessing, isListening]);
+  const orbPositionRef = useRef(orbPosition);
+  orbPositionRef.current = orbPosition;
+  const windowModeRef = useRef<WindowMode>('orb');
+  windowModeRef.current = windowMode;
+  const stopManualRecordingRef = useRef<() => Promise<void>>(async () => {});
+  const startProcessingWatchdogRef = useRef<() => void>(() => {});
+  const beginVoiceSessionRef = useRef<() => Promise<void>>(async () => {});
+  const nativeReadyRef = useRef(false);
+  const nativeListeningRef = useRef(false);
+  const nativeDevicesRef = useRef<Array<{ id: number; name: string }>>([]);
 
   useEffect(() => {
-    if (sheetState === 'hidden') return;
-    const timer = setInterval(tryCollapseSheet, 1000);
-    return () => clearInterval(timer);
-  }, [sheetState, tryCollapseSheet]);
+    const syncSettings = () => {
+      try {
+        const stored = localStorage.getItem('voiceSettings');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          setSettings((prev) => ({
+            ...prev,
+            ...(typeof parsed.voiceMode === 'string' ? { voiceMode: parsed.voiceMode } : {}),
+            ...(parsed.nativeMicDevice !== undefined
+              ? { nativeMicDevice: parsed.nativeMicDevice }
+              : {}),
+          }));
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener('storage', syncSettings);
+    window.addEventListener('jarvis-settings-change', syncSettings);
+    return () => {
+      window.removeEventListener('storage', syncSettings);
+      window.removeEventListener('jarvis-settings-change', syncSettings);
+    };
+  }, []);
 
-  const withTimeout = <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
-    new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(message)), ms);
-      promise.then(
-        (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      );
+  const closePanel = useCallback(() => {
+    setPanelOpen(false);
+    setQuickActionsOpen(false);
+    if (isElectron && windowModeRef.current !== 'orb') {
+      getElectronAPI()?.setWindowMode?.('orb');
+    }
+    setWindowMode('orb');
+  }, [isElectron]);
+
+  const openPanel = useCallback(
+    (view?: PanelView) => {
+      if (view) setPanelView(view);
+      setQuickActionsOpen(false);
+      setPanelOpen(true);
+      if (isElectron && windowModeRef.current !== 'panel') {
+        getElectronAPI()?.setWindowMode?.('panel', orbPositionRef.current.x, orbPositionRef.current.y);
+      }
+      setWindowMode('panel');
+    },
+    [isElectron],
+  );
+
+  const toggleQuickActions = useCallback(() => {
+    const next = !quickActionsOpen;
+    if (isElectron) {
+      getElectronAPI()?.setWindowMode?.(next ? 'menu' : 'orb', orbPositionRef.current.x, orbPositionRef.current.y);
+    }
+    setQuickActionsOpen(next);
+  }, [isElectron, quickActionsOpen]);
+
+  const closeQuickActions = useCallback(() => {
+    if (quickActionsOpen && isElectron) {
+      getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
+    }
+    setQuickActionsOpen(false);
+  }, [isElectron, quickActionsOpen]);
+
+  const handlePanelClose = useCallback(() => closePanel(), [closePanel]);
+
+  const getSessionToken = useCallback(async (): Promise<string | null> => {
+    const api = (window as any).electronAPI;
+    if (api?.getSessionToken) {
+      try {
+        const token = (await api.getSessionToken()) as string | null;
+        if (token) return token;
+      } catch {
+        /* ignore */
+      }
+    }
+    // Browser-mode fallback (non-Electron dev/test): allow a locally stored
+    // token so the voice WS handshake succeeds without the Electron bridge.
+    return localStorage.getItem('jarvisSessionToken');
+  }, []);
+
+  const resolveWebSocketUrl = useCallback((server: string, token: string | null) => {
+    const trimmed = server.replace(/\/*$/, '');
+    const native = settingsRef.current.voiceMode === 'native';
+    const endpoint = native ? '/ws/voice/native' : '/ws/voice';
+    let url: string;
+    if (trimmed.startsWith('ws://') || trimmed.startsWith('wss://')) {
+      url = `${trimmed}${endpoint}`;
+    } else if (trimmed.startsWith('http://')) {
+      url = `ws://${trimmed.slice(7)}${endpoint}`;
+    } else if (trimmed.startsWith('https://')) {
+      url = `wss://${trimmed.slice(8)}${endpoint}`;
+    } else {
+      url = `ws://${trimmed}${endpoint}`;
+    }
+    if (token) url += `?token=${encodeURIComponent(token)}`;
+    return url;
+  }, []);
+
+  const getVoiceContext = useCallback(
+    (): VoiceStateContext => ({
+      micPermissionGranted: micPermissionGrantedRef.current,
+      wsConnected: isConnectedRef.current,
+      hasTranscript: liveTranscriptRef.current.trim().length > 0,
+      hasResponse: assistantTextRef.current.trim().length > 0,
+      sttAvailable: true,
+      ttsAvailable: true,
+    }),
+    [],
+  );
+
+  const handleVoiceError = useCallback(
+    (stage: VoiceStage, error: unknown, fallback: string): string => {
+      const classified = classifyError(stage, error);
+      logVoice(stage, { code: classified.code, message: classified.message, level: 'error' });
+      return classified.message || fallback;
+    },
+    [],
+  );
+
+  const checkHealth = useCallback(async () => {
+    logVoice('health', { level: 'debug' });
+    const server = settings.serverUrl;
+    const result = await checkBackendHealth(server);
+    const diagnostics = await checkVoiceDiagnostics(server);
+    const stt = (diagnostics?.stt as { ready?: boolean } | undefined)?.ready;
+    const tts = (diagnostics?.tts as { ready?: boolean } | undefined)?.ready;
+    const llm = (diagnostics?.llm as { configured?: boolean } | undefined)?.configured;
+    logVoice('health', {
+      level: result.ok ? 'debug' : 'error',
+      backend: result.ok,
+      error: result.error,
+      stt,
+      tts,
+      llm,
     });
+  }, [settings.serverUrl]);
 
   const tryGetUserMedia = async (constraints: MediaStreamConstraints): Promise<MediaStream> => {
     try {
       return await withTimeout(
         navigator.mediaDevices.getUserMedia(constraints),
         6000,
-        'Microphone timed out opening the audio device',
+        'Microphone timed out',
       );
     } catch (err) {
       const name = (err as any)?.name || '';
       const message = (err as Error)?.message || '';
-      const processingFailed =
-        name === 'OverconstrainedError' || name === 'TimeoutError' || message.includes('timed out');
-      if (processingFailed && typeof constraints.audio === 'object') {
-        console.warn('Mic open failed with processing constraints, retrying plain audio', err);
+      if (
+        (name === 'OverconstrainedError' ||
+          name === 'TimeoutError' ||
+          message.includes('timed out')) &&
+        typeof constraints.audio === 'object'
+      ) {
         return withTimeout(
           navigator.mediaDevices.getUserMedia({ audio: true }),
           6000,
-          'Microphone timed out opening the audio device',
+          'Microphone timed out',
         );
       }
       throw err;
     }
   };
 
+  const tryGetUserMediaWithRetry = async (
+    constraints: MediaStreamConstraints,
+    retries = 2,
+  ): Promise<MediaStream> =>
+    retryWithBackoff(() => tryGetUserMedia(constraints), retries, 1000, 4000, 'mic');
+
   const ensureMicPermission = useCallback(async (): Promise<boolean> => {
-    if (micPermissionGrantedRef.current) {
-      return true;
-    }
+    if (micPermissionGrantedRef.current) return true;
     try {
       if (navigator.permissions && (navigator.permissions as any).query) {
         try {
@@ -230,33 +350,28 @@ function App() {
             micPermissionGrantedRef.current = true;
             return true;
           }
-          // 'prompt' or 'denied' → still try a real capture probe below; the OS
-          // prompt (or Electron's permission handler) decides the outcome.
-        } catch (permErr) {
-          console.warn('Permissions API query failed', permErr);
+        } catch {
+          /* ignore */
         }
       }
-      const stream = await tryGetUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
+      await tryGetUserMediaWithRetry({ audio: true });
       micPermissionGrantedRef.current = true;
       return true;
     } catch (err) {
-      console.error('Microphone permission check failed', err);
-      setError(
-        'Microphone access denied or unavailable. Check that a microphone is connected and JARVIS is allowed to use it.',
-      );
+      const message = handleVoiceError('mic', err, 'Microphone access denied.');
+      setError(message);
       return false;
     }
-  }, []);
+  }, [handleVoiceError]);
 
   useEffect(() => {
     let reconnectDelay = 1000;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
 
     const connect = async () => {
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        return;
-      }
+      if (cancelled) return;
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) return;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -267,139 +382,155 @@ function App() {
       }
       try {
         const token = await getSessionToken();
+        if (cancelled) return;
         const url = resolveWebSocketUrl(settings.serverUrl, token);
         ws.current = new WebSocket(url);
-
         ws.current.onopen = () => {
           isConnectedRef.current = true;
           awaitingPongRef.current = false;
           setError(null);
           reconnectDelay = 1000;
+          _setVoiceMachineState((prev) => transition(prev, 'ws_open', getVoiceContext()));
+          logVoice('ws_ready');
+          if (settingsRef.current.voiceMode === 'native') {
+            ws.current?.send(
+              JSON.stringify({
+                type: 'connect',
+                device: settingsRef.current.nativeMicDevice ?? undefined,
+              }),
+            );
+            ws.current?.send(JSON.stringify({ type: 'get_devices' }));
+          }
         };
-
         ws.current.onmessage = (event) => {
           let data: any;
           try {
             data = JSON.parse(event.data);
-          } catch (err) {
-            setError('Received invalid data from server');
+          } catch {
+            setError('Invalid data from server');
             return;
           }
-
-          if (data.type === 'pong') {
+          if (data.type === 'state' && settingsRef.current.voiceMode === 'native') {
+            nativeReadyRef.current = data.state === 'READY' || data.state === 'LISTENING';
+            nativeListeningRef.current = data.state === 'LISTENING';
+            setIsListening(data.state === 'LISTENING');
+            if (data.state === 'LISTENING') {
+              setOrbState('listening');
+              setSheetState('transcript');
+            } else if (data.state === 'PROCESSING') {
+              setOrbState('thinking');
+              setIsProcessing(true);
+            } else if (data.state === 'SPEAKING') {
+              setOrbState('speaking');
+            } else if (data.state === 'READY' || data.state === 'IDLE') {
+              setIsProcessing(false);
+              setIsListening(false);
+              nativeListeningRef.current = false;
+              if (!isPlayingAudioRef.current && audioQueueRef.current.length === 0) {
+                setOrbState('idle');
+              }
+            } else if (data.state === 'ERROR') {
+              setError(data.detail || 'Voice session error');
+              setOrbState('error');
+              if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+              errorTimerRef.current = setTimeout(() => {
+                setOrbState((prev) => (prev === 'error' ? 'idle' : prev));
+              }, 1600);
+            }
+          } else if (data.type === 'level' && settingsRef.current.voiceMode === 'native') {
+            setRms(Math.min(1, Math.max(0, data.rms)));
+          } else if (data.type === 'devices' && settingsRef.current.voiceMode === 'native') {
+            nativeDevicesRef.current = data.devices ?? [];
+          } else if (data.type === 'pong') {
             awaitingPongRef.current = false;
           } else if (data.type === 'response') {
             setAssistantText(data.text);
             setSheetState('response');
-            resetCollapseTimer();
-
-            if (requestStartRef.current && settingsRef.current.enableNotifications) {
-              const elapsed = Date.now() - requestStartRef.current;
-              if (elapsed >= LONG_TASK_MS) {
-                const api = (window as any).electronAPI;
-                if (api?.showNotification) {
-                  api
-                    .showNotification('JARVIS', 'Your request is ready.')
-                    .catch((err: unknown) => console.warn('Notification failed', err));
-                }
-              }
-            }
-            requestStartRef.current = 0;
-
-            if (data.audio) {
-              enqueueAudioRef.current(data.audio);
-            }
-
+            lastActivityRef.current = Date.now();
+            if (data.audio) enqueueAudioRef.current(data.audio);
             if (processingTimerRef.current) {
               clearTimeout(processingTimerRef.current);
               processingTimerRef.current = undefined;
             }
             setIsProcessing(false);
-            processingRef.current = false;
+            // Only show the orb as speaking if there is queued/playing audio;
+            // otherwise return straight to idle so the UI never sticks.
+            if (audioQueueRef.current.length > 0 || isPlayingAudioRef.current) {
+              setOrbState('speaking');
+            } else {
+              setOrbState('idle');
+            }
+            _setVoiceMachineState((prev) => transition(prev, 'audio_finished', getVoiceContext()));
           } else if (data.type === 'partial') {
             setAssistantText(data.text);
             setSheetState('response');
-            resetCollapseTimer();
+            lastActivityRef.current = Date.now();
           } else if (data.type === 'transcript') {
             setLiveTranscript(data.text);
-            resetCollapseTimer();
+            lastActivityRef.current = Date.now();
           } else if (data.type === 'status') {
-            if (data.status === 'processing') {
-              setOrbState('thinking');
-            } else if (data.status === 'generating_speech') {
-              setOrbState('speaking');
-            }
+            if (data.status === 'processing') setOrbState('thinking');
+            else if (data.status === 'generating_speech') setOrbState('speaking');
           } else if (data.type === 'proactive') {
             if (data.text) {
               setAssistantText(data.text);
               setSheetState('response');
-              resetCollapseTimer();
-              if (settingsRef.current.enableNotifications) {
-                const api = (window as any).electronAPI;
-                if (api?.showNotification) {
-                  api
-                    .showNotification('JARVIS reminder', data.text)
-                    .catch((err: unknown) => console.warn('Notification failed', err));
-                }
-              }
+              lastActivityRef.current = Date.now();
             }
           } else if (data.type === 'audio_queue') {
+            pendingSegmentsRef.current = data.count ?? 0;
             setOrbState('speaking');
           } else if (data.type === 'audio_segment_start') {
             audioChunksRef.current = [];
-          } else if (data.type === 'audio_chunk') {
-            if (data.chunk) {
-              audioChunksRef.current.push(data.chunk);
-            }
+          } else if (data.type === 'audio_chunk' && data.chunk) {
+            audioChunksRef.current.push(data.chunk);
           } else if (data.type === 'audio_segment_end') {
             const combined = audioChunksRef.current.join('');
             audioChunksRef.current = [];
             if (combined) {
               enqueueAudioRef.current(combined);
-            }
-          } else if (data.type === 'error') {
-            setError(data.message);
-            setOrbState('idle');
-            if (
-              requestStartRef.current &&
-              settingsRef.current.enableNotifications &&
-              Date.now() - requestStartRef.current >= LONG_TASK_MS
-            ) {
-              const api = (window as any).electronAPI;
-              if (api?.showNotification) {
-                api
-                  .showNotification('JARVIS', 'Something went wrong while processing your request.')
-                  .catch((err: unknown) => console.warn('Notification failed', err));
+            } else {
+              // No audio arrived for this segment (e.g. TTS failed). Recover
+              // immediately so the orb does not get stuck on speaking.
+              if (
+                audioQueueRef.current.length === 0 &&
+                !isPlayingAudioRef.current &&
+                pendingSegmentsRef.current <= 1
+              ) {
+                setOrbState('idle');
               }
             }
-            requestStartRef.current = 0;
+            if (pendingSegmentsRef.current > 0) {
+              pendingSegmentsRef.current -= 1;
+            }
+          } else if (data.type === 'error') {
+            const message = handleVoiceError('ws', data.message, 'Connection error');
+            setError(message);
+            setOrbState('idle');
             if (processingTimerRef.current) {
               clearTimeout(processingTimerRef.current);
               processingTimerRef.current = undefined;
             }
             setIsProcessing(false);
-            processingRef.current = false;
             setSheetState('hidden');
+            _setVoiceMachineState((prev) => transition(prev, 'ws_failed', getVoiceContext()));
           }
         };
-
         ws.current.onerror = () => {
-          console.error('WebSocket error');
-          setError('Connection error');
+          const message = handleVoiceError(
+            'ws',
+            new Error('WebSocket connection error'),
+            'Connection error',
+          );
+          setError(message);
           isConnectedRef.current = false;
           setIsProcessing(false);
-          processingRef.current = false;
+          _setVoiceMachineState((prev) => transition(prev, 'ws_failed', getVoiceContext()));
         };
-
         ws.current.onclose = () => {
           isConnectedRef.current = false;
-          // If the socket dies while a request is in flight, do not leave the
-          // UI stuck in "processing" (silently blocking future taps).
           setIsProcessing(false);
-          processingRef.current = false;
-          if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-          }
+          if (reconnectTimer) clearTimeout(reconnectTimer);
           reconnectTimer = setTimeout(() => {
             reconnectDelay = Math.min(reconnectDelay * 2, 60000);
             const jitter = Math.random() * 0.3 + 0.85;
@@ -409,30 +540,21 @@ function App() {
           }, reconnectDelay);
         };
       } catch (err) {
-        setError('Failed to connect to server');
+        const message = handleVoiceError('ws', err, 'Failed to connect to server');
+        setError(message);
+        _setVoiceMachineState((prev) => transition(prev, 'ws_failed', getVoiceContext()));
       }
     };
 
     connect();
-
     const interval = setInterval(() => {
-      if (!isConnectedRef.current && !reconnectTimer) {
-        reconnectTimer = setTimeout(() => {
-          reconnectDelay = Math.min(reconnectDelay * 2, 60000);
-          connect();
-        }, reconnectDelay);
-      }
+      if (!isConnectedRef.current && !reconnectTimer)
+        reconnectTimer = setTimeout(connect, reconnectDelay);
     }, 5000);
-
-    // Heartbeat: send a ping every 25 s and force a reconnect if the server
-    // does not answer within 15 s (detects half-open connections).
     const pingInterval = setInterval(() => {
       const socket = ws.current;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        return;
-      }
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
       if (awaitingPongRef.current && Date.now() - pingSentAtRef.current > 15000) {
-        console.error('WebSocket heartbeat timed out; forcing reconnect');
         socket.close();
         return;
       }
@@ -440,108 +562,125 @@ function App() {
         socket.send(JSON.stringify({ type: 'ping' }));
         awaitingPongRef.current = true;
         pingSentAtRef.current = Date.now();
-      } catch (err) {
-        console.error('Failed to send heartbeat ping', err);
+      } catch {
+        /* ignore */
       }
     }, 25000);
 
     return () => {
+      cancelled = true;
       clearInterval(interval);
       clearInterval(pingInterval);
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-      }
-      if (ws.current) {
-        ws.current.close();
-      }
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws.current) ws.current.close();
     };
-  }, [settings.serverUrl, resetCollapseTimer]);
+  }, [
+    settings.serverUrl,
+    settings.voiceMode,
+    getSessionToken,
+    resolveWebSocketUrl,
+    handleVoiceError,
+    getVoiceContext,
+  ]);
+
+  useEffect(() => {
+    checkHealth();
+    const interval = setInterval(checkHealth, 30000);
+    return () => clearInterval(interval);
+  }, [checkHealth]);
 
   useEffect(() => {
     const initAudio = async () => {
       try {
         audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      } catch (err) {
-        setError('Audio context not supported');
+      } catch {
+        setError('Audio not supported');
       }
     };
     initAudio();
-  }, []);
-
-  useEffect(() => {
     return () => {
-      if (recordingTimerRef.current) {
-        clearTimeout(recordingTimerRef.current);
-      }
-      if (processingTimerRef.current) {
-        clearTimeout(processingTimerRef.current);
-      }
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+      if (recordingTimerRef.current) clearTimeout(recordingTimerRef.current);
+      if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
       if (audioWorkletNodeRef.current) {
         audioWorkletNodeRef.current.port.onmessage = null;
         try {
           audioWorkletNodeRef.current.disconnect();
-        } catch (err) {
-          console.warn('Failed to stop audio worklet on unmount', err);
+        } catch {
+          /* ignore */
         }
         audioWorkletNodeRef.current = null;
       }
       if (audioSourceRef.current) {
         try {
           audioSourceRef.current.disconnect();
-        } catch (err) {
-          console.warn('Failed to disconnect audio source on unmount', err);
+        } catch {
+          /* ignore */
         }
         audioSourceRef.current = null;
       }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track: MediaStreamTrack) => track.stop());
-      }
-      if (audioContext.current && audioContext.current.state !== 'closed') {
+      if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+      if (audioContext.current && audioContext.current.state !== 'closed')
         audioContext.current.close().catch(() => {});
-      }
     };
+  }, []);
+
+  useEffect(() => {
+    let raf: number;
+    const updateRms = () => {
+      if (analysers.current[0]) {
+        const data = new Uint8Array(analysers.current[0].frequencyBinCount);
+        analysers.current[0].getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+        const r = Math.sqrt(sum / data.length) / 255;
+        setRms(r);
+      }
+      raf = requestAnimationFrame(updateRms);
+    };
+    raf = requestAnimationFrame(updateRms);
+    return () => cancelAnimationFrame(raf);
   }, []);
 
   const listeningRef = useRef(isListening);
   const processingRef = useRef(isProcessing);
-
   listeningRef.current = isListening;
   processingRef.current = isProcessing;
 
-  const triggerWakeWord = useCallback(async () => {
-    if (listeningRef.current || processingRef.current) {
+  const toggleTalk = useCallback(async () => {
+    if (processingRef.current) return;
+    if (settingsRef.current.voiceMode === 'native') {
+      const socket = ws.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      if (listeningRef.current || nativeListeningRef.current) {
+        socket.send(JSON.stringify({ type: 'stop_listening' }));
+        nativeListeningRef.current = false;
+        setIsListening(false);
+        setOrbState('thinking');
+        setIsProcessing(true);
+        requestStartRef.current = Date.now();
+        startProcessingWatchdogRef.current();
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'start_listening', mode: 'ptt' }));
+      nativeListeningRef.current = true;
+      setIsListening(true);
+      setSheetState('transcript');
+      setLiveTranscript('Listening...');
       return;
     }
-    await beginVoiceSession();
+    if (listeningRef.current) {
+      await stopManualRecordingRef.current();
+      return;
+    }
+    await beginVoiceSessionRef.current();
   }, []);
-
-  useEffect(() => {
-    const api = (window as any).electronAPI;
-    if (!api?.onWakeWordDetected) return;
-
-    const handler = () => {
-      if (listeningRef.current || processingRef.current) return;
-      triggerWakeWord();
-    };
-
-    const unsubscribe = api.onWakeWordDetected(handler);
-    return () => {
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
-    };
-  }, [triggerWakeWord]);
 
   const sendAudioStart = () => {
     const socket = ws.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(
-      JSON.stringify({
-        type: 'audio_start',
-        format: 'pcm16',
-        sample_rate: 16000,
-        channels: 1,
-      }),
+      JSON.stringify({ type: 'audio_start', format: 'pcm16', sample_rate: 16000, channels: 1 }),
     );
   };
 
@@ -574,60 +713,43 @@ function App() {
     if (Date.now() - silenceStartRef.current >= ENDPOINT_SILENCE_MS) {
       silenceStartRef.current = null;
       setIsEndpointing(true);
-      if (audioWorkletNodeRef.current) {
-        void stopManualRecording();
-      }
+      if (audioWorkletNodeRef.current) void stopManualRecordingRef.current();
     }
   };
 
   const startRecording = async () => {
     try {
-      const stream = await tryGetUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+      const stream = await tryGetUserMediaWithRetry({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       streamRef.current = stream;
-
       setIsListening(true);
-      listeningRef.current = true;
       setOrbState('listening');
-      setLiveTranscript('Recording... tap the orb again to send');
+      setLiveTranscript('Recording...');
       setSheetState('transcript');
-      resetCollapseTimer();
+      lastActivityRef.current = Date.now();
       setIsEndpointing(false);
       let ctx = audioContext.current;
       if (!ctx || ctx.state === 'closed') {
         ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
         audioContext.current = ctx;
       }
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
-      }
-
-      // Resampling + PCM16 encoding happen off the main thread in the worklet.
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
       await ctx.audioWorklet.addModule(PCM_WORKLET_URL);
-
       const source = ctx.createMediaStreamSource(stream);
       const worklet = new AudioWorkletNode(ctx, 'pcm16-capture', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         processorOptions: { sampleRate: ctx.sampleRate },
       });
-      // Pull the worklet through a zero-gain node so capture stays active
-      // without routing the mic to the speakers.
       const zeroGain = ctx.createGain();
       zeroGain.gain.value = 0;
       source.connect(worklet);
       worklet.connect(zeroGain);
       zeroGain.connect(ctx.destination);
-
       const analyser = ctx.createAnalyser();
       source.connect(analyser);
       analysers.current = [analyser];
-
       worklet.port.onmessage = (event) => {
         if (!event.data || event.data.type !== 'pcm') return;
         const bytes = event.data.pcm as ArrayBuffer;
@@ -642,34 +764,23 @@ function App() {
         }
         checkEndpointing(new Uint8Array(bytes));
       };
-
       sendAudioStart();
       audioSourceRef.current = source;
       audioWorkletNodeRef.current = worklet;
-
       recordingStartedAtRef.current = Date.now();
       speechDetectedRef.current = false;
       silenceStartRef.current = null;
-
-      // Safety: never record forever. Auto-stop after 30 seconds.
-      if (recordingTimerRef.current) {
-        clearTimeout(recordingTimerRef.current);
-      }
+      if (recordingTimerRef.current) clearTimeout(recordingTimerRef.current);
       recordingTimerRef.current = setTimeout(() => {
-        if (audioWorkletNodeRef.current) {
-          void stopManualRecording();
-        }
+        if (audioWorkletNodeRef.current) void stopManualRecordingRef.current();
       }, 30000);
     } catch (err) {
-      console.error('Failed to start microphone recording', err);
-      setError(
-        'Could not start the microphone. Check that a microphone is connected and JARVIS has permission to use it.',
-      );
+      const message = handleVoiceError('mic', err, 'Could not start the microphone.');
+      setError(message);
       setOrbState('idle');
       setIsListening(false);
-      listeningRef.current = false;
-      analysers.current = [];
       setSheetState('hidden');
+      _setVoiceMachineState((prev) => transition(prev, 'mic_denied', getVoiceContext()));
     }
   };
 
@@ -680,47 +791,43 @@ function App() {
     }
     if (audioWorkletNodeRef.current) {
       audioWorkletNodeRef.current.port.onmessage = null;
-      audioWorkletNodeRef.current.disconnect();
+      try {
+        audioWorkletNodeRef.current.disconnect();
+      } catch {
+        /* ignore */
+      }
       audioWorkletNodeRef.current = null;
     }
     if (audioSourceRef.current) {
       try {
         audioSourceRef.current.disconnect();
-      } catch (err) {
-        console.warn('Failed to disconnect audio source', err);
+      } catch {
+        /* ignore */
       }
       audioSourceRef.current = null;
     }
-    if (stream) {
-      stream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
-    }
+    if (stream) stream.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     analysers.current = [];
     silenceStartRef.current = null;
   };
 
   const stopManualRecording = async () => {
+    if (settingsRef.current.voiceMode === 'native') return;
     const stream = streamRef.current;
     if (!audioWorkletNodeRef.current && !stream) {
       setIsListening(false);
-      listeningRef.current = false;
       setOrbState('idle');
       setSheetState('hidden');
       return;
     }
-
     setIsListening(false);
-    listeningRef.current = false;
-
-    // Ask the worklet to emit the deferred boundary sample and any remaining
-    // PCM, then send audio_end only after the tail has been transmitted.
     try {
       const worklet = audioWorkletNodeRef.current;
       if (worklet) {
         await new Promise<void>((resolve) => {
           flushResolveRef.current = resolve;
           worklet.port.postMessage({ type: 'flush' });
-          // Safety: never wait forever if the worklet is already gone.
           setTimeout(() => {
             if (flushResolveRef.current) {
               flushResolveRef.current = null;
@@ -729,143 +836,177 @@ function App() {
           }, 500);
         });
       }
-    } catch (err) {
-      console.error('Failed to flush audio buffer', err);
+    } catch {
+      /* ignore */
     }
-
     sendAudioEnd();
     cleanupListening(stream);
     setIsEndpointing(false);
-
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
       setError('Not connected to server');
       setSheetState('hidden');
       return;
     }
-
     setOrbState('thinking');
     setLiveTranscript('Transcribing...');
     setIsProcessing(true);
-    processingRef.current = true;
     requestStartRef.current = Date.now();
-    startProcessingWatchdog();
+    startProcessingWatchdogRef.current();
   };
+  stopManualRecordingRef.current = stopManualRecording;
 
   const beginVoiceSession = async () => {
-    if (processingRef.current || listeningRef.current || micBusyRef.current) {
+    if (processingRef.current || listeningRef.current || micBusyRef.current) return;
+    if (settingsRef.current.voiceMode === 'native') {
+      const socket = ws.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setError('Not connected to server');
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'connect', device: settingsRef.current.nativeMicDevice }));
+      await new Promise<void>((resolve) => {
+        const check = () => {
+          if (nativeReadyRef.current) resolve();
+          else setTimeout(check, 100);
+        };
+        setTimeout(check, 100);
+      });
+      micBusyRef.current = true;
+      try {
+        socket.send(JSON.stringify({ type: 'start_listening', mode: 'ptt' }));
+        nativeListeningRef.current = true;
+        setIsListening(true);
+        setSheetState('transcript');
+        setLiveTranscript('Listening...');
+      } finally {
+        micBusyRef.current = false;
+      }
       return;
     }
     micBusyRef.current = true;
     try {
       const hasPermission = await ensureMicPermission();
       if (!hasPermission) return;
-      if (navigator.vibrate) {
-        navigator.vibrate(50);
-      }
+      if (navigator.vibrate) navigator.vibrate(50);
       setSheetState('transcript');
-      resetCollapseTimer();
+      lastActivityRef.current = Date.now();
       await startRecording();
     } finally {
       micBusyRef.current = false;
     }
   };
+  beginVoiceSessionRef.current = beginVoiceSession;
 
-  const toggleTalk = useCallback(async () => {
-    if (processingRef.current) return;
-    if (listeningRef.current) {
-      await stopManualRecording();
-      return;
-    }
-    await beginVoiceSession();
-  }, [stopManualRecording]);
+  const triggerWakeWord = useCallback(async () => {
+    if (listeningRef.current || processingRef.current) return;
+    const attempt = (n: number) => {
+      if (listeningRef.current || processingRef.current) return;
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        _setVoiceMachineState((prev) => transition(prev, 'wake_word_detected', getVoiceContext()));
+        void beginVoiceSessionRef.current();
+        return;
+      }
+      if (n < 8) setTimeout(() => attempt(n + 1), 500);
+    };
+    attempt(0);
+  }, [getVoiceContext]);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return;
-      if (e.code === 'Space' || e.key === ' ') {
-        const target = e.target as HTMLElement | null;
-        if (
-          target &&
-          (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
-        ) {
-          return;
-        }
-        e.preventDefault();
-        toggleTalk();
-      }
+    const api = (window as any).electronAPI;
+    if (!api?.onWakeWordDetected) return;
+    const handler = () => {
+      if (listeningRef.current || processingRef.current) return;
+      triggerWakeWord();
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [toggleTalk]);
+    const unsubscribe = api.onWakeWordDetected(handler);
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, [triggerWakeWord]);
+
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onSwitchView) return;
+    const unsubscribe = api.onSwitchView((view: string) => {
+      openPanel(view as PanelView);
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, [openPanel]);
+
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onTogglePanel) return;
+    const unsubToggle = api.onTogglePanel(() => {
+      if (panelOpen) closePanel();
+      else openPanel();
+    });
+    const unsubOpen = api.onOpenPanel(() => openPanel());
+    const unsubClose = api.onClosePanel(() => closePanel());
+    return () => {
+      if (typeof unsubToggle === 'function') unsubToggle();
+      if (typeof unsubOpen === 'function') unsubOpen();
+      if (typeof unsubClose === 'function') unsubClose();
+    };
+  }, [panelOpen, openPanel, closePanel]);
 
   useEffect(() => {
     const api = (window as any).electronAPI;
     if (!api?.onVoiceControl) return;
-
-    const handler = (action: string) => {
-      if (action === 'start') {
-        if (listeningRef.current || processingRef.current) return;
-        beginVoiceSession();
-      } else if (action === 'stop') {
-        if (listeningRef.current) {
-          stopManualRecording();
-        }
+    const unsubscribe = api.onVoiceControl((action: string) => {
+      if (action === 'toggle' || action === 'start') toggleTalk();
+      else if (action === 'stop') {
+        if (listeningRef.current) toggleTalk();
       }
-    };
-
-    const unsubscribe = api.onVoiceControl(handler);
+    });
     return () => {
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
+      if (typeof unsubscribe === 'function') unsubscribe();
     };
-  }, [beginVoiceSession, stopManualRecording]);
+  }, [toggleTalk]);
 
-  const startProcessingWatchdog = () => {
-    if (processingTimerRef.current) {
-      clearTimeout(processingTimerRef.current);
-    }
-    processingTimerRef.current = setTimeout(() => {
-      if (processingRef.current) {
-        console.error('Processing watchdog fired: no reply within 45s');
-        setIsProcessing(false);
-        processingRef.current = false;
-        setOrbState('idle');
-        setError('The assistant took too long to respond. Please try again.');
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onContextMenuAction) return;
+    const unsubscribe = api.onContextMenuAction((action: string) => {
+      if (action === 'talk') toggleTalk();
+      else if (action === 'quit') api.quitApp?.();
+      else openPanel(action as PanelView);
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
+  }, [toggleTalk, openPanel]);
+
+  useEffect(() => {
+    if (!isElectron) return;
+    const api = getElectronAPI();
+    let cancelled = false;
+    api?.getOrbPosition?.().then((pos: { x: number; y: number } | null) => {
+      if (!cancelled && pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+        setOrbPosition(pos);
+        localStorage.setItem(ORB_POSITION_KEY, JSON.stringify(pos));
       }
-    }, 45000);
-  };
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isElectron]);
 
-  const sendMessage = async (content: string) => {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
-      setError('Not connected to server');
-      setSheetState('hidden');
-      return;
-    }
+  useEffect(() => {
+    localStorage.setItem(ORB_POSITION_KEY, JSON.stringify(orbPosition));
+  }, [orbPosition]);
 
-    try {
-      setIsProcessing(true);
-      processingRef.current = true;
-      setOrbState('thinking');
-      resetCollapseTimer();
-      requestStartRef.current = Date.now();
-      startProcessingWatchdog();
-
-      ws.current.send(
-        JSON.stringify({
-          type: 'text',
-          content,
-        }),
-      );
-    } catch (err) {
-      console.error('Failed to send message', err);
-      setError('Failed to send message');
-      setIsProcessing(false);
-      processingRef.current = false;
-      setOrbState('idle');
-      setSheetState('hidden');
-    }
-  };
+  useEffect(() => {
+    if (!quickActionsOpen) return;
+    const timer = setTimeout(() => closeQuickActions(), 6000);
+    const handleBlur = () => closeQuickActions();
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [quickActionsOpen, closeQuickActions]);
 
   const playNextAudio = useCallback(() => {
     if (isPlayingAudioRef.current) return;
@@ -882,7 +1023,6 @@ function App() {
         String.fromCharCode(audioData[0], audioData[1], audioData[2], audioData[3]) === 'RIFF';
       const blob = new Blob([audioData], { type: isWav ? 'audio/wav' : 'audio/mpeg' });
       const url = URL.createObjectURL(blob);
-
       const audio = new Audio(url);
       audio.volume = settings.volume;
       audio.playbackRate = settings.speed;
@@ -901,7 +1041,7 @@ function App() {
         isPlayingAudioRef.current = false;
         playNextAudio();
       });
-    } catch (err) {
+    } catch {
       setError('Failed to play audio');
       isPlayingAudioRef.current = false;
       playNextAudio();
@@ -915,211 +1055,202 @@ function App() {
     },
     [playNextAudio],
   );
-
   enqueueAudioRef.current = enqueueAudio;
 
-  const handleSaveSettings = (updatedSettings: SettingsState, updatedEmailConfig: EmailConfig) => {
-    setSettings(updatedSettings);
-    setEmailConfig(updatedEmailConfig);
-
-    localStorage.setItem('voiceSettings', JSON.stringify(updatedSettings));
-    localStorage.setItem('serverUrl', updatedSettings.serverUrl);
-    localStorage.setItem('emailAddress', updatedEmailConfig.email);
-
-    if (showOnboarding) {
-      localStorage.setItem('jarvisOnboarded', 'true');
-      setShowOnboarding(false);
-    }
-
-    if (updatedEmailConfig.email && updatedEmailConfig.appPassword && updatedSettings.serverUrl) {
-      const apiUrl = updatedSettings.serverUrl.trim();
-      const baseUrl = apiUrl.startsWith('http') ? apiUrl : `http://${apiUrl}`;
-      fetch(`${baseUrl}/api/mail/auth`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: updatedEmailConfig.email,
-          password: updatedEmailConfig.appPassword,
-        }),
-      })
-        .then((res) => {
-          if (!res.ok) {
-            console.warn('Mail auth request failed:', res.status, res.statusText);
-            return;
-          }
-          return res.json();
-        })
-        .then((data) => {
-          if (data && data.token) {
-            localStorage.setItem('emailSessionToken', data.token);
-            setEmailConfig((prev) => ({ ...prev, sessionToken: data.token, appPassword: '' }));
-          }
-        })
-        .catch((error) => {
-          console.warn('Mail auth request failed', error);
-        });
-    }
+  const startProcessingWatchdog = () => {
+    if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
+    processingTimerRef.current = setTimeout(() => {
+      if (processingRef.current) {
+        setIsProcessing(false);
+        setOrbState('idle');
+        setError('The assistant took too long to respond.');
+      }
+    }, 45000);
   };
+  startProcessingWatchdogRef.current = startProcessingWatchdog;
+
+  const handleOrbDragMove = useCallback(
+    (dx: number, dy: number) => {
+      if (!dragStartPosRef.current) {
+        dragStartPosRef.current = {
+          x: orbPositionRef.current.x - dx,
+          y: orbPositionRef.current.y - dy,
+        };
+        // Grow the window while dragging so a fast flick cannot leave the
+        // cursor outside the (otherwise tiny) window and drop the mousemove
+        // stream. The orb stays centered under the cursor the whole time.
+        if (isElectron) {
+          setWindowMode('menu');
+          getElectronAPI()?.setWindowMode?.('menu', orbPositionRef.current.x, orbPositionRef.current.y);
+        }
+      }
+      const start = dragStartPosRef.current;
+      const next = { x: Math.round(start.x + dx), y: Math.round(start.y + dy) };
+      if (isElectron) {
+        const applied = getElectronAPI()?.setOrbPosition?.(next.x, next.y);
+        if (applied && typeof applied.then === 'function') {
+          applied.then((pos: { x: number; y: number } | null) => {
+            if (pos && typeof pos.x === 'number') setOrbPosition(pos);
+          });
+        }
+      } else {
+        setOrbPosition(next);
+      }
+    },
+    [isElectron],
+  );
+
+  const handleOrbDragEnd = useCallback(() => {
+    dragStartPosRef.current = null;
+    localStorage.setItem(ORB_POSITION_KEY, JSON.stringify(orbPositionRef.current));
+    if (isElectron) {
+      setWindowMode('orb');
+      getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
+    }
+  }, [isElectron]);
+
+  const handleOrbContextMenu = useCallback(() => {
+    getElectronAPI()?.showContextMenu?.();
+  }, []);
+
+  const handleQuickAction = useCallback(
+    (action: 'talk' | 'chat' | 'memory' | 'tools') => {
+      setQuickActionsOpen(false);
+      if (action === 'talk') {
+        if (isElectron) getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
+        toggleTalk();
+      } else {
+        openPanel(action);
+      }
+    },
+    [toggleTalk, openPanel, isElectron],
+  );
+
+  const handlePanelToggleTalk = useCallback(() => {
+    if (isProcessing) return;
+    toggleTalk();
+  }, [isProcessing, toggleTalk]);
+
+  const handlePanelViewChange = useCallback((view: PanelView) => {
+    setPanelView(view);
+  }, []);
+
+  useEffect(() => {
+    logVoice('fsm', { level: 'debug', state: _voiceMachineState });
+  }, [_voiceMachineState]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      if (e.ctrlKey && e.code === 'Space') {
+        e.preventDefault();
+        if (!isElectron) toggleTalk();
+        return;
+      }
+      if (e.key === 'Escape' && panelOpen) {
+        handlePanelClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [toggleTalk, panelOpen, handlePanelClose, isElectron]);
+
+  const effectiveOrbState: OrbState = panelOpen && orbState === 'idle' ? 'panel-open' : orbState;
+
+  const orbAnchorStyle = useMemo(() => {
+    if (isElectron) {
+      if (windowMode === 'panel') {
+        return { position: 'absolute' as const, left: PANEL_ANCHOR.x, top: PANEL_ANCHOR.y, transform: 'translate(-50%, -50%)', display: 'none' };
+      }
+      const anchor = windowMode === 'menu' ? MENU_WINDOW / 2 : ORB_WINDOW / 2;
+      return { position: 'absolute' as const, left: anchor, top: anchor, transform: 'translate(-50%, -50%)' };
+    }
+    return { position: 'absolute' as const, left: orbPosition.x, top: orbPosition.y, transform: 'translate(-50%, -50%)' };
+  }, [isElectron, windowMode, orbPosition]);
+
+  const showTransientHud = !isElectron || windowMode === 'panel';
 
   return (
-    <ErrorBoundary>
-      <div className="app" role="main" aria-label="JARVIS Voice Assistant">
-        {showOnboarding && (
-          <Onboarding
-            settings={settings}
-            emailConfig={emailConfig}
-            onSave={(newSettings, newEmail) => {
-              handleSaveSettings(newSettings, newEmail);
-            }}
-            onSkip={() => {
-              localStorage.setItem('jarvisOnboarded', 'true');
-              setShowOnboarding(false);
-            }}
-          />
-        )}
-        <main className="app-main">
-          <div
-            className={`orb-container ${isListening ? 'recording' : ''}`}
-            onClick={toggleTalk}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                toggleTalk();
-              }
-            }}
-            role="button"
-            tabIndex={0}
-            aria-label={isListening ? 'Stop recording' : 'Talk to JARVIS'}
-            aria-pressed={isListening}
-            title={isListening ? 'Tap to stop and send' : 'Tap to talk'}
-          >
-            <VoiceOrb state={orbState} analysers={analysers.current} />
-            <div className="orb-hint">
-              {isProcessing
-                ? 'Thinking...'
-                : isListening
-                  ? isEndpointing
-                    ? 'Finishing...'
-                    : audioWorkletNodeRef.current
-                      ? 'Tap to stop'
-                      : 'Listening...'
-                  : 'Tap to talk'}
+    <ToastProvider>
+      <ErrorBoundary>
+        <div className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''}`} role="main" aria-label="JARVIS Voice Assistant">
+          {showOnboarding && (panelOpen || !isElectron) && (
+            <div className="onboarding-overlay" aria-hidden={!showOnboarding}>
+              <div className="onboarding-panel">
+                <h2>Welcome to JARVIS</h2>
+                <p>Your desktop companion is ready. Configure your settings to get started.</p>
+                <button
+                  onClick={() => {
+                    localStorage.setItem('jarvisOnboarded', 'true');
+                    setShowOnboarding(false);
+                  }}
+                >
+                  Get Started
+                </button>
+              </div>
             </div>
-            {isListening && liveTranscript && (
+          )}
+          <main className="app-main">
+            <div
+              className={`orb-anchor ${isListening ? 'recording' : ''} ${windowMode === 'panel' ? 'orb-anchor-hidden' : ''}`}
+              style={orbAnchorStyle as React.CSSProperties}
+            >
+              <OrbEngine
+                state={effectiveOrbState}
+                rms={rms}
+                onToggleTalk={toggleTalk}
+                onExpandPanel={() => openPanel()}
+                onSingleClick={toggleQuickActions}
+                onQuickAction={handleQuickAction}
+                onClick={handlePanelClose}
+                onDragMove={handleOrbDragMove}
+                onDragEnd={handleOrbDragEnd}
+                onContextMenu={handleOrbContextMenu}
+                quickActionsOpen={quickActionsOpen}
+                onCloseQuickActions={closeQuickActions}
+              />
+            </div>
+
+            {showTransientHud && (
+              <div className="orb-hint" aria-live="polite">
+                {isProcessing
+                  ? 'Thinking...'
+                  : isListening
+                    ? isEndpointing
+                      ? 'Finishing...'
+                      : 'Tap to stop'
+                    : 'Tap to talk'}
+              </div>
+            )}
+
+            {showTransientHud && isListening && liveTranscript && (
               <div className="orb-caption" aria-live="polite">
                 {liveTranscript}
               </div>
             )}
-          </div>
 
-          <button
-            className="settings-btn"
-            onClick={() => setShowSettings(!showSettings)}
-            title="Settings"
-            aria-label="Open settings"
-          >
-            ⚙️
-          </button>
+            <Panel
+              open={panelOpen}
+              view={panelView}
+              onViewChange={handlePanelViewChange}
+              onClose={handlePanelClose}
+              orbPosition={orbPosition}
+              onToggleTalk={handlePanelToggleTalk}
+              fillWindow={isElectron}
+            />
+          </main>
 
-          <button
-            className="settings-btn"
-            onClick={() => setShowMemory(true)}
-            title="Memory Vault"
-            aria-label="Open memory vault"
-          >
-            📚
-          </button>
-
-          <div
-            className={`bottom-sheet ${sheetState !== 'hidden' ? 'open' : ''}`}
-            aria-hidden={sheetState === 'hidden'}
-            role="region"
-            aria-label="Conversation panel"
-          >
-            <div className="sheet-handle" aria-hidden="true" />
-            <div className="sheet-content">
-              {sheetState === 'transcript' && (
-                <div className="sheet-transcript" aria-live="polite">
-                  <p>{liveTranscript}</p>
-                </div>
-              )}
-              {assistantText && (
-                <div className="sheet-response" aria-live="polite">
-                  <p>{assistantText}</p>
-                </div>
-              )}
+          {showTransientHud && error && (
+            <div className="error-banner" role="alert" aria-live="assertive">
+              <p>{error}</p>
+              <button onClick={() => setError(null)} aria-label="Dismiss error">
+                &#10005;
+              </button>
             </div>
-          </div>
-
-          <form
-            className="text-input-bar"
-            onSubmit={(e) => {
-              e.preventDefault();
-              const text = textInput.trim();
-              if (!text) return;
-              setLiveTranscript(text);
-              setSheetState('transcript');
-              resetCollapseTimer();
-              sendMessage(text);
-              setTextInput('');
-            }}
-          >
-            <label htmlFor="text-input" className="sr-only">
-              Type a message
-            </label>
-            <input
-              id="text-input"
-              type="text"
-              value={textInput}
-              onChange={(e) => setTextInput(e.target.value)}
-              placeholder="Type a message (or tap the orb to talk)..."
-              aria-label="Type a message"
-              aria-describedby="input-help"
-            />
-            <button type="submit" title="Send" aria-label="Send message">
-              ➤
-            </button>
-            <span id="input-help" className="sr-only">
-              Press Enter to send
-            </span>
-          </form>
-        </main>
-
-        {error && (
-          <div className="error-banner" role="alert" aria-live="assertive">
-            <p>{error}</p>
-            <button onClick={() => setError(null)} aria-label="Dismiss error">
-              ✕
-            </button>
-          </div>
-        )}
-
-        {showSettings && (
-          <Suspense
-            fallback={
-              <div className="settings-overlay" aria-label="Loading settings">
-                <div className="settings-panel">
-                  <div className="settings-content">Loading…</div>
-                </div>
-              </div>
-            }
-          >
-            <Settings
-              onClose={() => setShowSettings(false)}
-              settings={settings}
-              emailConfig={emailConfig}
-              onSave={handleSaveSettings}
-            />
-          </Suspense>
-        )}
-
-        {showMemory && (
-          <Suspense fallback={<div className="memory-overlay">Loading memory vault…</div>}>
-            <MemoryPage onClose={() => setShowMemory(false)} />
-          </Suspense>
-        )}
-      </div>
-    </ErrorBoundary>
+          )}
+        </div>
+      </ErrorBoundary>
+    </ToastProvider>
   );
 }
 

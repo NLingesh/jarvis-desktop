@@ -1,310 +1,68 @@
 # JARVIS Source Code - File Manifest
 
-Generated: June 20, 2026  
-Total Files: 30  
-Total Code Lines: ~3,500+
+Generated: August 9, 2026  
+Backend: ~15,000 Python LOC · 104 files (81 source + 22 test files + conftest)  
+Frontend: ~14,300 TS/TSX/CSS LOC · 6 test files  
+Electron: 2 files (~1,030 LOC)
 
-## 📂 Project Structure
+## Project Structure
 
 ### Backend (`jarvis_backend/`)
 
-**Core Server**
-- `main.py` (340 lines) - FastAPI server, WebSocket handler, command processor
+**Entry point**
+- `main.py` (588 lines) - FastAPI app: 25 routers, WS `/ws/voice` streaming pipeline, security middlewares (CSP, rate-limit, perf), SPA static hosting
 
-**Modules** (`modules/`)
-- `__init__.py` - Package initialization
-- `memory.py` (240 lines) - SQLite conversation storage with FTS5
-- `claude_api.py` (90 lines) - Claude Haiku integration
-- `tts.py` (140 lines) - ElevenLabs + fallback TTS
-- `calendar_module.py` (200 lines) - Calendar integration (Evolution/GNOME)
-- `mail_module.py` (250 lines) - IMAP/SMTP email access
-- `notes_module.py` (190 lines) - JSON-based note storage
-- `web_browse.py` (220 lines) - Web search, weather, translation APIs
-- `system_actions.py` (230 lines) - System monitoring (CPU, memory, disk, processes)
+**Route modules** (`routes/` - REST + WS endpoints)
+- `state.py` (755) - shared singletons, command processing, skill registry, profile notes, TTS streaming helpers
+- `deps.py` (71) - backward-compatible re-exports of singletons/helpers
+- `auth.py` · `system.py` · `stt.py` · `settings.py` · `vision.py` · `vault.py` · `tools.py` · `search.py` · `voice.py` · `llm.py` · `mail.py` · `notes.py` · `calendar.py` · `memory.py` (310) · `tasks.py` · `automation.py` · `adaptive.py` · `proactive_ai.py` · `security.py` · `performance.py` · `projects.py` · `git_routes.py` · `code_routes.py` · `models.py` · `plugins.py`
 
-**Configuration**
-- `requirements.txt` - Python dependencies (13 packages)
-- `.env.example` - Environment variables template
-- `Dockerfile` - Docker image definition
+**Manager layer** (`managers/` - domain services)
+- `memory_manager.py` (999) · `conversation_manager.py` · `system_manager.py` · `stt_manager.py` · `tts_manager.py` · `voice_manager.py` · `audio_manager.py` · `vision_manager.py` · `model_manager.py` · `security_manager.py` · `performance_manager.py` · `project_manager.py` · `git_manager.py` · `code_manager.py` · `task_manager.py` · `workflow_manager.py` · `adaptive_intelligence.py` · `proactive_ai.py`
 
-### Frontend (`jarvis_frontend/`)
+**Modules** (`modules/` - core capabilities)
+- `llm_provider.py` (393) - Mistral/Anthropic/Ollama providers + NVIDIA rerank
+- `stt.py` (340) - Vosk offline STT + streaming recognizer + wake-word spotter
+- `tts.py` (253) - ElevenLabs → Edge TTS → local engine fallback chain
+- `mail_module.py` (301) · `calendar_module.py` · `notes_module.py` · `documents_module.py` · `web_browse.py` · `system_actions.py` (245) · `auth.py` · `audit.py` · `proactive.py` (193) · `settings.py` · `skill_registry.py` · `vision_module.py` · `claude_api.py`
+- `vault/` - markdown vault: `manager.py` (513), `search.py`, `store.py`, `codec.py`, `templates.py`
 
-**Main Application**
-- `src/App.tsx` (280 lines) - React app container, WebSocket management
-- `src/App.css` (600 lines) - Complete styling (dark theme)
-- `src/main.tsx` (10 lines) - React entry point
-- `src/vite-env.d.ts` (80 lines) - TypeScript type definitions
+**Plugin system** (`plugins/`)
+- `base.py` · `registry.py` · `loader.py` · `permissions.py` · `builtin/skills.py` (calendar/email/web/weather/translate/system/notes)
 
-**Components** (`src/components/`)
-- `VoiceOrb.tsx` (240 lines) - Three.js audio-reactive particle orb
-- `ChatInterface.tsx` (70 lines) - Message display + text input
-- `Settings.tsx` (240 lines) - Configuration panel
+**Tests** (`tests/` - 22 files)
+- Cover auth, memory, STT/TTS, vault, vision, WS voice, new routes, plugin skills, calendar/mail/notes/documents modules
 
-**Build Configuration**
-- `index.html` - HTML template
-- `package.json` - Node.js dependencies (React, Three.js, TypeScript)
-- `vite.config.ts` - Vite build configuration
-- `tsconfig.json` - TypeScript compiler options
-- `tsconfig.node.json` - Node-specific TypeScript config
-- `Dockerfile` - Multi-stage Docker image
+### Frontend (`jarvis_frontend/src/`)
 
-### Deployment & Documentation
+- `App.tsx` (918) - main panel: WS lifecycle, recording, endpointing, TTS queue, error classification
+- `bubble.tsx` (911) - floating orb: wake-word listener, PTT, hands-free command capture, reply + TTS playback
+- `audioStream.ts` · `voiceStateMachine.ts` · `voiceDiagnostics.ts` · `bubbleMain.tsx` · `main.tsx`
+- `components/` - `VoiceOrb.tsx` (Three.js particles), `MemoryPage.tsx`, `Settings.tsx`, `Onboarding.tsx`, `ToastProvider.tsx`, `NotificationToast.tsx`, `LoadingSpinner.tsx`
+- `orb/` - `OrbEngine.tsx`, `useAutonomousBehaviors.ts`, `useMicroMovements.ts`, `useOrbWarmth.ts`, `useParticleMemory.ts`
+- `panel/` - `Panel.tsx`, `usePanelChoreography.ts`, 15 views (`ChatView`, `MemoryView`, `FilesView`, `ModelsView`, `PluginsView`, `SettingsView`, `TasksView`, `ToolsView`, `ProjectsView`, `CodeView`, `AdaptiveView`, `AutomationView`, `PerformanceView`, `SecurityView`, `ProactiveView`)
+- `api/` - typed API clients (memory, vault, vision, tasks, tools, plugins, security, performance, adaptive, automation, proactive, developer)
+- `public/` - `pcmWorklet.js` (audio capture worklet), icons, manifest, `sw.js`
 
-**Deployment**
-- `docker-compose.yml` - Full stack Docker setup
+### Electron (`electron/`)
+- `main.js` (971) - window/tray management, backend subprocess, keychain (keytar), auto-update, IPC
+- `preload.js` (61) - contextBridge API
 
-**Documentation**
-- `JARVIS_README.md` (450 lines) - Complete documentation
-- `QUICKSTART.md` (280 lines) - Quick start guide
-- `ARCHITECTURE.md` (500 lines) - Architecture & code overview
-- `FILE_MANIFEST.md` (this file) - File listing
+### Tests
+- Backend: 22 test files (pytest)
+- Frontend: 6 test files (Vitest: `api/vault.test.ts`, `audioStream.test.ts`, `bubble.test.tsx`, `components/VoiceOrb.test.tsx`, `voiceDiagnostics.test.ts`, `voiceStateMachine.test.ts`) + `tests/e2e/app.spec.ts` (Playwright)
 
-**Utilities**
-- `setup.sh` (100 lines) - Automated setup script
-- `.gitignore` - Git ignore rules
+## Technologies
 
-## 📊 Code Statistics
+- **Backend**: FastAPI, Uvicorn, SQLite (WAL + FTS5), aiosqlite, Vosk, edge-tts, httpx, psutil, Pillow/pytesseract
+- **Frontend**: React 18, TypeScript 5, Vite, Three.js, AudioWorklet, Vitest, Testing Library
+- **Desktop**: Electron 30, electron-builder, electron-updater, keytar
 
-### Backend Python Code
-```
-main.py             ~340 lines
-memory.py           ~240 lines
-claude_api.py       ~90 lines
-tts.py              ~140 lines
-calendar_module.py  ~200 lines
-mail_module.py      ~250 lines
-notes_module.py     ~190 lines
-web_browse.py       ~220 lines
-system_actions.py   ~230 lines
-─────────────────────────────
-Total Backend:      ~1,700 lines
-```
+## DevOps
 
-### Frontend TypeScript/React Code
-```
-App.tsx             ~280 lines
-VoiceOrb.tsx        ~240 lines
-ChatInterface.tsx   ~70 lines
-Settings.tsx        ~240 lines
-App.css             ~600 lines
-─────────────────────────────
-Total Frontend:     ~1,430 lines
-```
+- `scripts/` - venv prep, Vosk model download, electron binary fixes
+- `docker-compose.yml` · `.github/workflows/ci.yml` (ruff, black, eslint, prettier, tsc, vitest, pytest, build)
 
-### Configuration Files
-```
-package.json        ~30 lines
-vite.config.ts      ~25 lines
-tsconfig.json       ~20 lines
-requirements.txt    ~15 lines
-docker-compose.yml  ~50 lines
-─────────────────────────────
-Total Config:       ~140 lines
-```
+## Documentation
 
-## 🎯 Key Features by File
-
-### Backend Modules
-
-| File | Purpose | Key Classes/Functions | Dependencies |
-|------|---------|----------------------|--------------|
-| memory.py | Conversation storage | MemoryManager | sqlite3 |
-| claude_api.py | LLM integration | ClaudeAPI | anthropic |
-| tts.py | Text-to-speech | TextToSpeechModule | httpx, subprocess |
-| calendar_module.py | Calendar access | CalendarModule | subprocess |
-| mail_module.py | Email management | MailModule | imaplib, email |
-| notes_module.py | Note storage | NotesModule | json, os |
-| web_browse.py | Web integration | WebBrowseModule | httpx, beautifulsoup4 |
-| system_actions.py | System monitoring | SystemActions | psutil, subprocess |
-
-### Frontend Components
-
-| File | Purpose | Technologies | Size |
-|------|---------|--------------|------|
-| VoiceOrb.tsx | 3D visualization | Three.js, WebGL | 240 lines |
-| ChatInterface.tsx | Message display | React hooks | 70 lines |
-| Settings.tsx | Configuration | React forms | 240 lines |
-| App.tsx | Main container | WebSocket, Web Speech API | 280 lines |
-
-## 🔧 Technologies Used
-
-### Backend Stack
-- **Framework**: FastAPI 0.104.1
-- **Server**: Uvicorn
-- **Database**: SQLite3 with FTS5
-- **AI**: Anthropic Claude Haiku
-- **TTS**: ElevenLabs + espeak
-- **HTTP**: httpx (async)
-- **System**: psutil
-- **Parsing**: BeautifulSoup4
-
-### Frontend Stack
-- **UI Framework**: React 18
-- **Build Tool**: Vite
-- **Language**: TypeScript 5.2
-- **3D Graphics**: Three.js r156
-- **Styling**: CSS3 with variables
-- **APIs**: Web Speech API, Web Audio API, Fetch API
-
-### DevOps
-- **Containerization**: Docker
-- **Orchestration**: Docker Compose
-- **Package Manager**: npm (Node), pip (Python)
-
-## 📦 Dependencies Summary
-
-### Python (13 packages)
-```
-fastapi==0.104.1
-uvicorn==0.24.0
-anthropic==0.7.1
-httpx==0.25.1
-beautifulsoup4==4.12.2
-psutil==5.9.6
-python-dotenv==1.0.0
-```
-
-### Node.js (4 core packages)
-```
-react@^18.2.0
-react-dom@^18.2.0
-three@^r156
-typescript@^5.2.0
-vite@^5.0.0
-```
-
-## 🚀 Deployment Options
-
-### Local Development
-```bash
-./setup.sh          # Automated setup
-# or manual setup via QUICKSTART.md
-```
-
-### Docker Single Container
-```bash
-docker build -t jarvis-backend jarvis_backend/
-docker run -p 8000:8000 jarvis-backend
-```
-
-### Docker Compose (Recommended)
-```bash
-docker-compose up -d
-```
-
-### Kubernetes
-Deploy using manifests (not included, but easy to generate)
-
-### Cloud Platforms
-- **AWS**: ECS, App Runner, Lambda
-- **Google Cloud**: Cloud Run, Cloud Functions
-- **Azure**: App Service, Container Instances
-- **Heroku**: Container Registry deployment
-
-## 📋 File Checklist
-
-Backend Files:
-- [x] main.py
-- [x] requirements.txt
-- [x] .env.example
-- [x] Dockerfile
-- [x] modules/__init__.py
-- [x] modules/memory.py
-- [x] modules/claude_api.py
-- [x] modules/tts.py
-- [x] modules/calendar_module.py
-- [x] modules/mail_module.py
-- [x] modules/notes_module.py
-- [x] modules/web_browse.py
-- [x] modules/system_actions.py
-
-Frontend Files:
-- [x] index.html
-- [x] src/main.tsx
-- [x] src/App.tsx
-- [x] src/App.css
-- [x] src/vite-env.d.ts
-- [x] src/components/VoiceOrb.tsx
-- [x] src/components/ChatInterface.tsx
-- [x] src/components/Settings.tsx
-- [x] package.json
-- [x] vite.config.ts
-- [x] tsconfig.json
-- [x] tsconfig.node.json
-- [x] Dockerfile
-
-Config & Deployment:
-- [x] docker-compose.yml
-- [x] setup.sh
-- [x] .gitignore
-
-Documentation:
-- [x] JARVIS_README.md
-- [x] QUICKSTART.md
-- [x] ARCHITECTURE.md
-- [x] FILE_MANIFEST.md (this file)
-
-## 🔍 Code Quality
-
-### Design Patterns Used
-- **Async/Await**: Non-blocking I/O throughout
-- **Dependency Injection**: Modules initialized in main.py
-- **Context Manager**: Proper resource cleanup
-- **Observer Pattern**: WebSocket event handlers
-- **Factory Pattern**: Session creation
-- **Singleton Pattern**: Database connections
-
-### Best Practices
-- Type hints in TypeScript and Python (where applicable)
-- Docstrings for public methods
-- Error handling with try-catch/except
-- Environment variables for sensitive data
-- Logging for debugging
-- CORS configuration
-- Input validation
-
-### Security Features
-- API key management via .env
-- SQL injection prevention (parameterized queries)
-- HTTPS-ready (use with reverse proxy)
-- WebSocket over WSS in production
-- Rate limiting ready (add middleware)
-- CORS filtering
-
-## 📚 Learning Resources
-
-By studying this code, you'll learn:
-
-1. **Backend**: FastAPI, WebSockets, SQLite, async Python
-2. **Frontend**: React with TypeScript, Three.js, Web APIs
-3. **AI Integration**: Claude API, streaming responses
-4. **Full-Stack**: How voice AI systems work end-to-end
-5. **DevOps**: Docker, Docker Compose, containerization
-6. **Real-Time Communication**: WebSocket optimization
-
-## 🎓 Extension Ideas
-
-- Add authentication (JWT tokens)
-- Implement plugin system for modules
-- Add multi-user support
-- Create web dashboard
-- Mobile app (React Native)
-- Desktop app (Electron/Tauri)
-- Additional integrations (Slack, Jira, etc.)
-- Advanced analytics
-- Model fine-tuning pipeline
-
-## 📄 License & Attribution
-
-All code is MIT Licensed - free to use and modify.
-
-Built with:
-- Claude API by Anthropic
-- FastAPI community
-- React ecosystem
-- Three.js community
-- Docker community
-
----
-
-**Ready to deploy?** Start with `QUICKSTART.md` or run `./setup.sh`!
+`AGENTS.md` · `JARVIS_README.md` · `ARCHITECTURE.md` · `DESKTOP_COMPANION_SPEC.md` · `IMPLEMENTATION_ROADMAP.md` · `INTERACTION_MODEL.md` · `UI_DESIGN.md` · `WS_PROTOCOL.md` · `VOICE_PIPELINE_PHASE2/3/4.md` · `DEPLOYMENT.md` · `QUICKSTART.md` · `FILE_MANIFEST.md`

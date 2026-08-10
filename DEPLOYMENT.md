@@ -40,7 +40,7 @@ Before running JARVIS, ensure you have:
 ### Step 1: Setup Environment
 
 ```bash
-cd /home/wiz/Desktop/maybe\ jarvis
+cd "/home/wiz/Desktop/Project Folder/maybe jarvis"
 
 # Create virtual environment
 python3 -m venv venv
@@ -112,7 +112,7 @@ Expected output:
 
 1. Open browser to `http://localhost:5173`
 2. Allow microphone access
-3. Click the orb or say "JARVIS" (if wake-word enabled)
+3. Click the orb (or say "computer" if wake-word enabled)
 4. Speak your request
 5. Listen to the response
 

@@ -26,7 +26,7 @@ def test_to_base64_roundtrip():
 
 def test_get_supported_voices():
     voices = TextToSpeechModule.get_supported_voices()
-    assert len(voices) == 4
+    assert len(voices) == 3
     assert all("id" in v and "name" in v for v in voices)
 
 

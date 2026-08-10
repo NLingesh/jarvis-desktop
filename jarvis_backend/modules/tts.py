@@ -14,24 +14,62 @@ logger = logging.getLogger(__name__)
 class TextToSpeechModule:
     def __init__(self):
         self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-        self.voice_id = "9BBfe6637e99185c8b146cb8f3523044"  # Default ElevenLabs voice
+        self.voice_id = os.getenv("ELEVENLABS_VOICE_ID") or ""
+        self.elevenlabs_model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
         self.use_elevenlabs = bool(self.elevenlabs_api_key)
         self.edge_tts_voice = os.getenv("EDGE_TTS_VOICE", "en-US-GuyNeural")
 
-    async def generate_speech(self, text: str, voice_id: str | None = None) -> str:
-        """Generate speech and return as base64 audio"""
+    def diagnostics(self) -> dict:
+        """Structured status for health checks and the diagnostics endpoint."""
+        engines = [e for e in ("espeak-ng", "espeak", "piper") if shutil.which(e)]
+        edge_available = False
+        try:
+            import edge_tts  # noqa: F401
+
+            edge_available = True
+        except Exception:
+            pass
+        return {
+            "elevenlabs_configured": self.use_elevenlabs,
+            "elevenlabs_voice_id": self.voice_id,
+            "edge_tts_available": edge_available,
+            "edge_tts_voice": self.edge_tts_voice,
+            "system_engines": engines,
+            "ready": self.use_elevenlabs or edge_available or bool(engines),
+        }
+
+    async def generate_speech(
+        self, text: str, voice_id: str | None = None, retries: int = 2
+    ) -> str:
+        """Generate speech and return as base64 audio with automatic retry."""
         if self.use_elevenlabs:
+            for attempt in range(retries):
+                try:
+                    audio_data = await self._elevenlabs_tts(text, voice_id)
+                    return self._to_base64(audio_data)
+                except Exception as e:
+                    if attempt < retries - 1:
+                        wait = min(1.0 * (2**attempt), 5.0)
+                        logger.warning(
+                            f"ElevenLabs attempt {attempt + 1} failed, retrying in {wait}s: {e}"
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(f"ElevenLabs failed after {retries} attempts: {e}")
+
+        for attempt in range(retries):
             try:
-                audio_data = await self._elevenlabs_tts(text, voice_id)
+                audio_data = await self._edge_tts(text)
                 return self._to_base64(audio_data)
             except Exception as e:
-                logger.warning(f"ElevenLabs failed, falling back to local TTS: {e}")
-
-        try:
-            audio_data = await self._edge_tts(text)
-            return self._to_base64(audio_data)
-        except Exception as e:
-            logger.warning(f"Edge TTS failed, falling back to system TTS: {e}")
+                if attempt < retries - 1:
+                    wait = min(1.0 * (2**attempt), 5.0)
+                    logger.warning(
+                        f"Edge TTS attempt {attempt + 1} failed, retrying in {wait}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.warning(f"Edge TTS failed after {retries} attempts: {e}")
 
         return await self._system_tts(text)
 
@@ -47,7 +85,7 @@ class TextToSpeechModule:
                 headers={"xi-api-key": self.elevenlabs_api_key, "Content-Type": "application/json"},
                 json={
                     "text": text,
-                    "model_id": "eleven_monolingual_v1",
+                    "model_id": self.elevenlabs_model,
                     "voice_settings": {"stability": 0.75, "similarity_boost": 0.75},
                 },
             )
@@ -76,7 +114,7 @@ class TextToSpeechModule:
                 }
                 payload = {
                     "text": text,
-                    "model_id": "eleven_monolingual_v1",
+                    "model_id": self.elevenlabs_model,
                     "voice_settings": {"stability": 0.75, "similarity_boost": 0.75},
                 }
                 try:
@@ -207,10 +245,9 @@ class TextToSpeechModule:
 
     @staticmethod
     def get_supported_voices() -> list:
-        """Return list of supported ElevenLabs voices"""
+        """Return list of common ElevenLabs voices (configurable via env)."""
         return [
-            {"id": "9BBfe6637e99185c8b146cb8f3523044", "name": "British Male"},
             {"id": "EXAVITQu4vr4xnSDxMaL", "name": "Bella"},
             {"id": "XB0fDUnXU5powFXDhCwa", "name": "Alice"},
-            {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Ryan"},
+            {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel"},
         ]

@@ -15,6 +15,16 @@ python-json-logger==3.2.1
 PyYAML==6.0.3
 edge-tts==7.2.8
 vosk==0.3.45
+pytesseract==0.3.10
+
+# Phase 1 additions
+faster-whisper==1.2.1
+kokoro>=0.9.2
+ollama==0.4.0
+sounddevice==0.5.5
+webrtcvad==2.0.10
+silero-vad==6.2.1
+numpy==1.26.4
 
 # Dev / testing
 pytest==7.4.3

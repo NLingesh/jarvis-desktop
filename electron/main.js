@@ -80,7 +80,6 @@ function getVaultPath() {
 }
 
 let mainWindow = null;
-let bubbleWindow = null;
 let pyProc = null;
 let backendStdout = '';
 let backendStderr = '';
@@ -88,6 +87,19 @@ let shuttingDown = false;
 let appIsQuitting = false;
 let tray = null;
 let sessionToken = '';
+let windowMode = 'orb';
+
+// Single expanding window: the app is one frameless transparent window that
+// grows from a 96x96 orb, through a larger quick-actions canvas, to the full
+// panel sheet. The orb anchor stays screen-stable across every resize.
+const ORB_WINDOW = { width: 96, height: 96 };
+const MENU_WINDOW = { width: 240, height: 240 };
+const PANEL_WINDOW = { width: 380, height: 560 };
+const MODE_SPECS = {
+  orb: { width: ORB_WINDOW.width, height: ORB_WINDOW.height, anchorX: 48, anchorY: 48 },
+  menu: { width: MENU_WINDOW.width, height: MENU_WINDOW.height, anchorX: 120, anchorY: 120 },
+  panel: { width: PANEL_WINDOW.width, height: PANEL_WINDOW.height, anchorX: 190, anchorY: 520 },
+};
 
 function log(msg) {
   const ts = new Date().toISOString();
@@ -135,38 +147,78 @@ function getIconPath() {
   return undefined;
 }
 
-function getBubblePositionPath() {
-  return path.join(app.getPath('userData'), 'bubble-position.json');
+function getOrbPositionPath() {
+  return path.join(app.getPath('userData'), 'orb-position.json');
 }
 
-function loadBubblePosition() {
+function loadOrbPosition() {
   try {
-    const posPath = getBubblePositionPath();
+    const posPath = getOrbPositionPath();
     if (fs.existsSync(posPath)) {
       const data = JSON.parse(fs.readFileSync(posPath, 'utf8'));
       if (typeof data.x === 'number' && typeof data.y === 'number') {
-        return data;
+        return { x: data.x, y: data.y };
       }
     }
   } catch (e) {
-    log(`Failed to load bubble position: ${e.message}`);
+    log(`Failed to load orb position: ${e.message}`);
   }
   return null;
 }
 
-function saveBubblePosition(x, y) {
+function saveOrbPosition(x, y) {
   try {
-    fs.writeFileSync(getBubblePositionPath(), JSON.stringify({ x, y }));
+    fs.writeFileSync(getOrbPositionPath(), JSON.stringify({ x, y }));
   } catch (e) {
-    log(`Failed to save bubble position: ${e.message}`);
+    log(`Failed to save orb position: ${e.message}`);
   }
 }
 
-function getDefaultBubblePosition() {
+function getDefaultOrbPosition() {
   const { screen } = require('electron');
   const display = screen.getPrimaryDisplay();
-  const { width, height } = display.workAreaSize;
-  return { x: width - 96, y: height - 96 };
+  const { x, y, width, height } = display.workArea;
+  return { x: x + width - 96 - 24, y: y + height - 96 - 24 };
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(v, max));
+}
+
+// The orb anchor (where the orb should sit) for the current window mode, in
+// window-local coordinates.
+function currentOrbAnchor() {
+  const spec = MODE_SPECS[windowMode] || MODE_SPECS.orb;
+  return { x: spec.anchorX, y: spec.anchorY };
+}
+
+// Where the orb currently sits on screen (window top-left + anchor).
+function currentOrbCenter() {
+  if (!mainWindow) return getDefaultOrbPosition();
+  const [x, y] = mainWindow.getPosition();
+  const a = currentOrbAnchor();
+  return { x: x + a.x, y: y + a.y };
+}
+
+function applyWindowMode(mode, cx, cy) {
+  if (!mainWindow) return { x: cx, y: cy };
+  const spec = MODE_SPECS[mode] || MODE_SPECS.orb;
+  const area = getWorkArea();
+  const centerX = typeof cx === 'number' ? cx : currentOrbCenter().x;
+  const centerY = typeof cy === 'number' ? cy : currentOrbCenter().y;
+  const x = clamp(Math.round(centerX - spec.anchorX), area.x, area.x + area.width - spec.width);
+  const y = clamp(Math.round(centerY - spec.anchorY), area.y, area.y + area.height - spec.height);
+  mainWindow.setBounds({ x, y, width: spec.width, height: spec.height });
+  windowMode = mode;
+  const appliedCenter = { x: x + spec.anchorX, y: y + spec.anchorY };
+  saveOrbPosition(appliedCenter.x, appliedCenter.y);
+  return appliedCenter;
+}
+
+function sendToRenderer(channel, ...args) {
+  if (mainWindow && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(channel, ...args);
+  }
 }
 
 async function setupFirstRun() {
@@ -264,18 +316,29 @@ function createWindow() {
     return false;
   });
 
+  const spec = MODE_SPECS.orb;
+  const area = getWorkArea();
+  const saved = loadOrbPosition() || getDefaultOrbPosition();
+  const x = clamp(Math.round(saved.x - spec.anchorX), area.x, area.x + area.width - spec.width);
+  const y = clamp(Math.round(saved.y - spec.anchorY), area.y, area.y + area.height - spec.height);
+
   mainWindow = new BrowserWindow({
-    width: 480,
-    height: 720,
-    minWidth: 400,
-    minHeight: 600,
-    resizable: true,
-    center: true,
-    frame: true,
-    autoHideMenuBar: true,
-    titleBarStyle: 'default',
-    backgroundColor: '#0a0a0a',
+    width: spec.width,
+    height: spec.height,
+    x,
+    y,
+    minWidth: spec.width,
+    minHeight: spec.height,
+    maxWidth: PANEL_WINDOW.width,
+    maxHeight: PANEL_WINDOW.height,
+    resizable: false,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    center: false,
     title: 'JARVIS',
+    backgroundColor: '#00000000',
     webPreferences: {
       preload: getPreloadPath(),
       contextIsolation: true,
@@ -289,16 +352,15 @@ function createWindow() {
   });
 
   mainWindow.loadURL(`http://${BACKEND_HOST}:${BACKEND_PORT}`);
+  windowMode = 'orb';
 
-  mainWindow.on('close', (e) => {
-    if (!appIsQuitting) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
+  mainWindow.on('moved', () => {
+    const c = currentOrbCenter();
+    saveOrbPosition(c.x, c.y);
   });
 
   mainWindow.on('closed', () => {
-    log('Window closed');
+    log('Panel window closed');
     mainWindow = null;
   });
 }
@@ -313,6 +375,13 @@ async function startBackend() {
 
   const env = { ...process.env };
   env.SERVER_PORT = String(BACKEND_PORT);
+
+  // Always generate a session token and pass it to the backend via env, so the
+  // frontend's /ws/voice handshake succeeds in dev mode too (without it the
+  // backend generates an unknown token and rejects every connection).
+  const token = crypto.randomBytes(32).toString('hex');
+  env.SESSION_TOKEN = token;
+  sessionToken = token;
 
   if (!isDev) {
     // Retrieve API keys from OS keychain and inject into backend env
@@ -336,11 +405,8 @@ async function startBackend() {
     if (!fs.existsSync(tokenDir)) {
       fs.mkdirSync(tokenDir, { recursive: true });
     }
-    const token = crypto.randomBytes(32).toString('hex');
     fs.writeFileSync(env.SESSION_TOKEN_PATH, token);
     fs.chmodSync(env.SESSION_TOKEN_PATH, 0o600);
-    env.SESSION_TOKEN = token;
-    sessionToken = token;
     log(`Session token written to: ${env.SESSION_TOKEN_PATH}`);
 
     log(`Database path (packaged): ${env.DATABASE_PATH}`);
@@ -403,112 +469,84 @@ function stopBackend() {
   });
 }
 
-function createBubbleWindow() {
-  if (bubbleWindow) return;
-
-  const bubbleUrl = `http://${BACKEND_HOST}:${BACKEND_PORT}/bubble.html`;
-
-  const savedPos = loadBubblePosition();
-  const defaultPos = getDefaultBubblePosition();
-  const initialPos = savedPos || defaultPos;
-
-  bubbleWindow = new BrowserWindow({
-    width: 80,
-    height: 80,
-    x: initialPos.x,
-    y: initialPos.y,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    resizable: false,
-    center: false,
-    title: 'JARVIS Bubble',
-    webPreferences: {
-      preload: getPreloadPath(),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      allowRunningInsecureContent: false,
-      enableRemoteModule: false,
-    },
-  });
-
-  bubbleWindow.loadURL(bubbleUrl);
-
-  bubbleWindow.on('moved', () => {
-    const [x, y] = bubbleWindow.getPosition();
-    saveBubblePosition(x, y);
-  });
-
-  bubbleWindow.on('closed', () => {
-    log('Bubble window closed');
-    bubbleWindow = null;
-  });
-
-  bubbleWindow.on('close', (e) => {
-    if (!appIsQuitting) {
-      e.preventDefault();
-      bubbleWindow.hide();
-    }
-  });
+function getWorkArea() {
+  const { screen } = require('electron');
+  const display = screen.getPrimaryDisplay();
+  const { width, height } = display.workArea;
+  return { x: display.bounds.x, y: display.bounds.y, width, height };
 }
 
-function notifyBubbleOfMainWindowVisibility(visible) {
-  if (bubbleWindow && bubbleWindow.webContents && !bubbleWindow.webContents.isDestroyed()) {
-    bubbleWindow.webContents.send('main-window-visibility', visible);
-  }
+function togglePanel() {
+  sendToRenderer('toggle-panel');
 }
 
-function showMainWindow(nearBubble = false) {
-  if (!mainWindow) {
-    createWindow();
-  }
+function openPanel() {
+  sendToRenderer('open-panel');
+}
 
-  if (nearBubble && bubbleWindow) {
-    const [bubbleX, bubbleY] = bubbleWindow.getPosition();
-    const [mainWidth, mainHeight] = mainWindow.getSize();
-    const { screen } = require('electron');
-    const display = screen.getPrimaryDisplay();
-    const { width, height } = display.workAreaSize;
+function closePanel() {
+  sendToRenderer('close-panel');
+}
 
-    let x = bubbleX - mainWidth + 80;
-    let y = bubbleY - mainHeight + 80;
+function updatePanelPosition(x, y) {
+  if (!mainWindow) return;
+  const area = getWorkArea();
+  const [width, height] = mainWindow.getSize();
+  const clampedX = Math.max(area.x + 10, Math.min(x, area.x + area.width - width - 10));
+  const clampedY = Math.max(area.y + 10, Math.min(y, area.y + area.height - height - 10));
+  mainWindow.setPosition(clampedX, clampedY);
+}
 
-    if (x < 0) x = 20;
-    if (y < 0) y = 20;
-    if (x + mainWidth > width) x = width - mainWidth - 20;
-    if (y + mainHeight > height) y = height - mainHeight - 20;
-
-    mainWindow.setPosition(x, y);
-  }
-
+function showMainWindow() {
+  if (!mainWindow) createWindow();
   mainWindow.show();
   mainWindow.focus();
-  notifyBubbleOfMainWindowVisibility(true);
 }
 
-function showMainWindowFromWakeWord(nearBubble = false) {
-  showMainWindow(nearBubble);
+function showMainWindowFromWakeWord() {
+  showMainWindow();
   if (mainWindow && mainWindow.webContents) {
-    mainWindow.webContents.send('wake-word-detected');
+    const sendWake = () => sendToRenderer('wake-word-detected');
+    // The window is created eagerly, but on a cold wake the renderer may not
+    // have mounted yet; deliver the wake event once the page finished loading.
+    if (mainWindow.webContents.isLoading()) {
+      mainWindow.webContents.once('did-finish-load', () => setTimeout(sendWake, 500));
+    } else {
+      sendWake();
+    }
   }
 }
 
 function hideMainWindow() {
-  if (mainWindow) {
-    mainWindow.hide();
-    notifyBubbleOfMainWindowVisibility(false);
-  }
+  // The single window is always present as the orb; hiding would remove the
+  // companion entirely, so this is a no-op kept for IPC compatibility.
 }
 
 function toggleMainWindow() {
-  if (mainWindow && mainWindow.isVisible()) {
-    hideMainWindow();
-  } else {
-    showMainWindow(true);
-  }
+  togglePanel();
+}
+
+function buildOrbContextMenu() {
+  const { Menu } = require('electron');
+  const template = [
+    { label: 'Talk', click: () => sendToRenderer('context-menu-action', 'talk') },
+    { label: 'Chat', click: () => sendToRenderer('context-menu-action', 'chat') },
+    { label: 'Memory', click: () => sendToRenderer('context-menu-action', 'memory') },
+    { label: 'Files', click: () => sendToRenderer('context-menu-action', 'files') },
+    { type: 'separator' },
+    { label: 'Settings', click: () => sendToRenderer('context-menu-action', 'settings') },
+    { label: 'Models', click: () => sendToRenderer('context-menu-action', 'models') },
+    { label: 'Plugins', click: () => sendToRenderer('context-menu-action', 'plugins') },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      click: () => {
+        appIsQuitting = true;
+        app.quit();
+      },
+    },
+  ];
+  return Menu.buildFromTemplate(template);
 }
 
 function createTray() {
@@ -519,16 +557,24 @@ function createTray() {
 
   const contextMenu = require('electron').Menu.buildFromTemplate([
     {
-      label: 'Show JARVIS',
-      click: () => showMainWindow(true),
+      label: 'Toggle Panel',
+      click: () => togglePanel(),
     },
     {
-      label: 'Hide bubble',
-      click: () => {
-        if (bubbleWindow) {
-          bubbleWindow.hide();
-        }
-      },
+      label: 'Talk',
+      click: () => sendToRenderer('voice-control', 'start'),
+    },
+    {
+      label: 'Memory',
+      click: () => sendToRenderer('switch-view', 'memory'),
+    },
+    {
+      label: 'Files',
+      click: () => sendToRenderer('switch-view', 'files'),
+    },
+    {
+      label: 'Settings',
+      click: () => sendToRenderer('switch-view', 'settings'),
     },
     { type: 'separator' },
     {
@@ -544,7 +590,7 @@ function createTray() {
   tray.setContextMenu(contextMenu);
 
   tray.on('click', () => {
-    toggleMainWindow();
+    togglePanel();
   });
 }
 
@@ -575,8 +621,30 @@ async function init() {
     return;
   }
 
-  createBubbleWindow();
+  createWindow();
   createTray();
+
+  // Ctrl+Space toggles the voice session from anywhere on the desktop (the orb
+  // is always present and often unfocused). Register in dev and prod alike.
+  const voiceShortcut = process.env.VOICE_SHORTCUT || 'Control+Space';
+  try {
+    globalShortcut.register(voiceShortcut, () => {
+      sendToRenderer('voice-control', 'toggle');
+    });
+    log(`Registered global shortcut: ${voiceShortcut}`);
+  } catch (err) {
+    log(`Failed to register global shortcut ${voiceShortcut}: ${err.message}`);
+  }
+
+  const toggleShortcut = process.env.GLOBAL_SHORTCUT || 'CommandOrControl+Shift+J';
+  try {
+    globalShortcut.register(toggleShortcut, () => {
+      toggleMainWindow();
+    });
+    log(`Registered global shortcut: ${toggleShortcut}`);
+  } catch (err) {
+    log(`Failed to register global shortcut ${toggleShortcut}: ${err.message}`);
+  }
 
 autoUpdater.on('checking-for-update', () => {
   log('Checking for updates...');
@@ -636,12 +704,6 @@ autoUpdater.on('download-progress', (progressObj) => {
 });
 
 if (!isDev) {
-    const shortcut = process.env.GLOBAL_SHORTCUT || 'CommandOrControl+Shift+J';
-    globalShortcut.register(shortcut, () => {
-      toggleMainWindow();
-    });
-    log(`Registered global shortcut: ${shortcut}`);
-
     autoUpdater.checkForUpdatesAndNotify();
   }
 }
@@ -652,24 +714,70 @@ ipcMain.handle('reload-window', () => {
   if (mainWindow) mainWindow.reload();
 });
 ipcMain.handle('toggle-main-window', () => toggleMainWindow());
-ipcMain.handle('show-main-window', () => showMainWindow(true));
+ipcMain.handle('show-main-window', () => showMainWindow());
 ipcMain.handle('hide-main-window', () => hideMainWindow());
-ipcMain.handle('get-bubble-position', () => {
-  if (bubbleWindow) {
-    return bubbleWindow.getPosition();
-  }
-  return getDefaultBubblePosition();
+
+ipcMain.handle('toggle-panel', () => togglePanel());
+ipcMain.handle('open-panel', () => openPanel());
+ipcMain.handle('close-panel', () => closePanel());
+ipcMain.handle('update-panel-position', (_event, x, y) => updatePanelPosition(x, y));
+ipcMain.handle('get-work-area', () => getWorkArea());
+
+ipcMain.handle('set-window-mode', (_event, mode, cx, cy) => {
+  return applyWindowMode(mode, cx, cy);
 });
-ipcMain.handle('set-bubble-position', (_event, x, y) => {
-  if (bubbleWindow) {
-    bubbleWindow.setPosition(x, y);
-    saveBubblePosition(x, y);
-  }
+ipcMain.handle('get-orb-position', () => {
+  const c = currentOrbCenter();
+  return c;
+});
+ipcMain.handle('set-orb-position', (_event, cx, cy) => {
+  if (!mainWindow) return { x: cx, y: cy };
+  const a = currentOrbAnchor();
+  const area = getWorkArea();
+  const [width, height] = mainWindow.getSize();
+  const x = clamp(Math.round(cx - a.x), area.x, area.x + area.width - width);
+  const y = clamp(Math.round(cy - a.y), area.y, area.y + area.height - height);
+  mainWindow.setPosition(x, y);
+  const appliedCenter = { x: x + a.x, y: y + a.y };
+  saveOrbPosition(appliedCenter.x, appliedCenter.y);
+  return appliedCenter;
+});
+ipcMain.handle('show-context-menu', () => {
+  buildOrbContextMenu().popup({ window: mainWindow });
+});
+ipcMain.handle('quit-app', () => {
+  appIsQuitting = true;
+  app.quit();
+});
+
+ipcMain.handle('request-permission', async (_event, permission) => {
+  const result = await dialog.showMessageBox({
+    type: 'question',
+    title: 'JARVIS Permission',
+    message: `JARVIS requests permission to ${permission}`,
+    detail: 'This permission is required for the requested action. You can change this later in Settings.',
+    buttons: ['Allow', 'Deny'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  return { granted: result.response === 0 };
 });
 ipcMain.handle('notify-wake-word-detected', () => {
-  showMainWindowFromWakeWord(true);
+  showMainWindowFromWakeWord();
 });
 ipcMain.handle('get-session-token', () => sessionToken);
+
+ipcMain.handle('voice-log', (_event, payload) => {
+  const line = `[voice] ${JSON.stringify(payload)}`;
+  log(line);
+  try {
+    const file = path.join(app.getPath('userData'), 'voice.log');
+    fs.appendFileSync(file, `${line}\n`);
+  } catch (err) {
+    // A diagnostics log write must never break the voice pipeline.
+  }
+  return { ok: true };
+});
 
 ipcMain.handle('show-notification', (_event, { title, body }) => {
   try {
@@ -683,10 +791,11 @@ ipcMain.handle('show-notification', (_event, { title, body }) => {
 });
 
 ipcMain.handle('bubble-voice-control', (_event, action) => {
-  showMainWindow(true);
-  if (mainWindow && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
-    mainWindow.webContents.send('voice-control', action);
-  }
+  sendToRenderer('voice-control', action);
+});
+
+ipcMain.handle('switch-view', (_event, view) => {
+  sendToRenderer('switch-view', view);
 });
 
 

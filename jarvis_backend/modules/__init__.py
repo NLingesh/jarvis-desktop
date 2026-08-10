@@ -1,4 +1,4 @@
-from .memory import MemoryManager
+from managers.memory_manager import MemoryManager
 
 try:
     from .claude_api import ClaudeAPI

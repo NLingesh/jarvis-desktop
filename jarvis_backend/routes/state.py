@@ -15,12 +15,29 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
+from managers.adaptive_intelligence import AdaptiveIntelligenceManager
+from managers.audio_manager import AudioManager
+from managers.code_manager import CodeManager
+from managers.conversation_manager import ContextManager, ConversationManager, PreferenceManager
+from managers.git_manager import GitManager
+from managers.memory_manager import MemoryManager
+from managers.model_manager import ModelManager
+from managers.performance_manager import PerformanceManager
+from managers.proactive_ai import ProactiveAIManager
+from managers.project_manager import ProjectManager
+from managers.security_manager import SecurityManager
+from managers.stt_manager import STTManager
+from managers.system_manager import SystemManager
+from managers.task_manager import TaskManager
+from managers.tts_manager import TTSManager
+from managers.vision_manager import VisionManager
+from managers.voice_manager import VoiceManager
+from managers.workflow_manager import WorkflowManager
 from modules.auth import AuthService
 from modules.calendar_module import CalendarModule
 from modules.documents_module import DocumentsModule
 from modules.llm_provider import LLMProvider
 from modules.mail_module import MailModule, MailSessionStore
-from modules.memory import MemoryManager
 from modules.notes_module import NotesModule
 from modules.settings import (  # noqa: F401  (re-exported for routes.deps / tests)
     KEY_NAMES,
@@ -30,10 +47,11 @@ from modules.settings import (  # noqa: F401  (re-exported for routes.deps / tes
 from modules.skill_registry import Skill, SkillRegistry
 from modules.stt import SpeechToTextModule
 from modules.system_actions import ALLOWED_COMMANDS, SystemActions
-from modules.tts import TextToSpeechModule
 from modules.vault.manager import VaultManager
 from modules.vision_module import VisionModule
 from modules.web_browse import WebBrowseModule
+from plugins.permissions import PermissionManager
+from plugins.registry import PluginRegistry
 
 logger = logging.getLogger("jarvis")
 
@@ -167,11 +185,42 @@ mail = MailModule()
 mail_sessions = MailSessionStore(memory_manager)
 web_browse = WebBrowseModule()
 llm = LLMProvider()
-tts = TextToSpeechModule()
 system_actions = SystemActions()
 documents = DocumentsModule()
 stt = SpeechToTextModule()
 vision = VisionModule()
+
+# --- Manager singletons -----------------------------------------------------
+audio_manager = AudioManager()
+stt_manager = STTManager()
+tts_manager = TTSManager()
+tts = tts_manager
+voice_manager = VoiceManager(audio_manager, stt_manager, tts_manager, llm)
+model_manager = ModelManager()
+
+conversation_manager = ConversationManager(memory_manager, llm)
+preference_manager = PreferenceManager(memory_manager, llm)
+context_manager = ContextManager(
+    memory_manager, conversation_manager, calendar, mail, system_actions
+)
+system_manager = SystemManager(memory_manager)
+vision_manager = VisionManager(memory_manager)
+security_manager = SecurityManager(memory_manager)
+performance_manager = PerformanceManager()
+project_manager = ProjectManager(memory_manager)
+git_manager = GitManager(memory_manager)
+code_manager = CodeManager(memory_manager, llm)
+
+task_manager = TaskManager(memory_manager)
+workflow_manager = WorkflowManager(memory_manager)
+
+adaptive_intelligence = AdaptiveIntelligenceManager(
+    memory_manager, preference_manager, context_manager
+)
+proactive_ai = ProactiveAIManager(llm, memory_manager, adaptive_intelligence)
+
+plugin_registry = PluginRegistry()
+permission_manager = PermissionManager()
 
 # --- Markdown vault ---------------------------------------------------------
 MEMORY_VAULT_PATH = os.getenv("MEMORY_VAULT_PATH") or os.path.join(
@@ -558,23 +607,38 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
     return context
 
 
-async def _stream_sentence_audio(websocket, sentence: str) -> None:
-    """Stream TTS audio for one sentence using the standard segment flow."""
+async def _stream_sentence_audio(websocket, sentence: str, voice_uid: str) -> None:
+    """Stream TTS audio for one sentence using the standard segment flow.
+
+    Sends ``audio_segment_start`` → ``audio_chunk``* → ``audio_segment_end``.
+    If the TTS pipeline produces no audio, sends an ``error`` message so the
+    frontend can transition out of the speaking state instead of hanging.
+    """
     await websocket.send_json({"type": "audio_segment_start"})
+    chunks = 0
     try:
         async for audio_chunk in tts.stream_speech(sentence):
+            chunks += 1
             await websocket.send_json({"type": "audio_chunk", "chunk": audio_chunk})
-    except Exception:
-        try:
-            audio_base64 = await tts.generate_speech(sentence)
-            if audio_base64:
-                await websocket.send_json({"type": "audio_chunk", "chunk": audio_base64})
-        except Exception as e:
-            logger.error("TTS failed for sentence: %s", e)
+    except Exception as e:
+        logger.error("[voice:%s] TTS streaming failed for sentence: %s", voice_uid, e)
+
+    if chunks == 0:
+        logger.warning(
+            "[voice:%s] TTS produced no audio — sending error so UI recovers",
+            voice_uid,
+        )
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "Speech generation failed. Check your TTS configuration.",
+                }
+            )
     await websocket.send_json({"type": "audio_segment_end"})
 
 
-async def stream_speech_to_socket(websocket, text: str) -> None:
+async def stream_speech_to_socket(websocket, text: str, voice_uid: str) -> None:
     """Speak ``text`` over a websocket using the standard TTS segment flow."""
     text = (text or "").strip()
     if not text:
@@ -584,10 +648,12 @@ async def stream_speech_to_socket(websocket, text: str) -> None:
         sentences = [text]
     await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
     for sentence in sentences:
-        await _stream_sentence_audio(websocket, sentence)
+        await _stream_sentence_audio(websocket, sentence, voice_uid)
 
 
-async def handle_user_input(user_input: str, session_id: str, websocket) -> None:
+async def handle_user_input(
+    user_input: str, session_id: str, websocket, voice_uid: str = ""
+) -> None:
     """Process a single user utterance: gather context, stream LLM reply and TTS."""
     from starlette.websockets import WebSocketDisconnect  # noqa: F401
 
@@ -604,7 +670,11 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
     try:
         context = await process_command(user_input, session_id=session_id)
 
-        # Inject the user profile/preferences note so the LLM knows the user.
+        context_manager_result = await context_manager.build_context(
+            session_id=session_id, query=user_input
+        )
+        context.setdefault("intelligence", context_manager_result)
+
         profile = await get_profile_note()
         if profile and profile.get("body"):
             context["profile"] = profile["body"]
@@ -642,7 +712,7 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
                     await asyncio.sleep(0.01)
         except Exception as e:
             llm_failed = True
-            logger.error("LLM streaming failed: %s", e)
+            logger.error("[voice:%s] LLM streaming failed: %s", voice_uid, e)
 
         if buffer.strip():
             sentences.append(buffer.strip())
@@ -661,7 +731,7 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
                 mark_terminal()
                 return
 
-        logger.info("LLM: %s", full_text.strip())
+        logger.info("[voice:%s] LLM: %s", voice_uid, full_text.strip())
         await memory_manager.add_message(session_id, "assistant", full_text.strip())
 
         if sentences:
@@ -669,7 +739,7 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
             await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
 
             for sentence in sentences:
-                await _stream_sentence_audio(websocket, sentence)
+                await _stream_sentence_audio(websocket, sentence, voice_uid)
 
         await websocket.send_json(
             {
@@ -682,7 +752,7 @@ async def handle_user_input(user_input: str, session_id: str, websocket) -> None
     except WebSocketDisconnect:
         raise
     except Exception as e:
-        logger.error("handle_user_input failed: %s", e)
+        logger.error("[voice:%s] handle_user_input failed: %s", voice_uid, e)
         with contextlib.suppress(Exception):
             await websocket.send_json(
                 {"type": "error", "message": "Something went wrong. Please try again."}

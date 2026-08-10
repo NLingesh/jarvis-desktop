@@ -1,0 +1,15 @@
+export { default as ChatView } from './ChatView';
+export { default as MemoryView } from './MemoryView';
+export { default as FilesView } from './FilesView';
+export { default as ModelsView } from './ModelsView';
+export { default as PluginsView } from './PluginsView';
+export { default as SettingsView } from './SettingsView';
+export { default as ToolsView } from './ToolsView';
+export { default as TasksView } from './TasksView';
+export { default as AutomationView } from './AutomationView';
+export { default as AdaptiveView } from './AdaptiveView';
+export { default as ProactiveView } from './ProactiveView';
+export { default as SecurityView } from './SecurityView';
+export { default as PerformanceView } from './PerformanceView';
+export { default as ProjectsView } from './ProjectsView';
+export { default as CodeView } from './CodeView';

@@ -8,16 +8,54 @@ contextBridge.exposeInMainWorld('electronAPI', {
   toggleMainWindow: () => ipcRenderer.invoke('toggle-main-window'),
   showMainWindow: () => ipcRenderer.invoke('show-main-window'),
   hideMainWindow: () => ipcRenderer.invoke('hide-main-window'),
-  getBubblePosition: () => ipcRenderer.invoke('get-bubble-position'),
-  setBubblePosition: (x: number, y: number) => ipcRenderer.invoke('set-bubble-position', x, y),
+
+  togglePanel: () => ipcRenderer.invoke('toggle-panel'),
+  openPanel: () => ipcRenderer.invoke('open-panel'),
+  closePanel: () => ipcRenderer.invoke('close-panel'),
+  updatePanelPosition: (x, y) => ipcRenderer.invoke('update-panel-position', x, y),
+  getWorkArea: () => ipcRenderer.invoke('get-work-area'),
+
+  setWindowMode: (mode, cx, cy) => ipcRenderer.invoke('set-window-mode', mode, cx, cy),
+  getOrbPosition: () => ipcRenderer.invoke('get-orb-position'),
+  setOrbPosition: (cx, cy) => ipcRenderer.invoke('set-orb-position', cx, cy),
+  showContextMenu: () => ipcRenderer.invoke('show-context-menu'),
+  quitApp: () => ipcRenderer.invoke('quit-app'),
+
+  onContextMenuAction: (callback) => {
+    const handler = (_event, action) => callback(action);
+    ipcRenderer.on('context-menu-action', handler);
+    return () => ipcRenderer.removeListener('context-menu-action', handler);
+  },
+
+  onTogglePanel: (callback) => {
+    const handler = (_event, ...args) => callback(...args);
+    ipcRenderer.on('toggle-panel', handler);
+    return () => ipcRenderer.removeListener('toggle-panel', handler);
+  },
+
+  onOpenPanel: (callback) => {
+    const handler = (_event, ...args) => callback(...args);
+    ipcRenderer.on('open-panel', handler);
+    return () => ipcRenderer.removeListener('open-panel', handler);
+  },
+
+  onClosePanel: (callback) => {
+    const handler = (_event, ...args) => callback(...args);
+    ipcRenderer.on('close-panel', handler);
+    return () => ipcRenderer.removeListener('close-panel', handler);
+  },
+
+  requestPermission: (permission) => ipcRenderer.invoke('request-permission', permission),
+
   notifyWakeWordDetected: () => ipcRenderer.invoke('notify-wake-word-detected'),
   getSessionToken: () => ipcRenderer.invoke('get-session-token'),
+  logVoice: (payload) => ipcRenderer.invoke('voice-log', payload),
 
   showNotification: (title, body) => ipcRenderer.invoke('show-notification', { title, body }),
   bubbleVoiceControl: (action) => ipcRenderer.invoke('bubble-voice-control', action),
 
-  onVoiceControl: (callback: (action: string) => void) => {
-    const handler = (_event: any, action: string) => callback(action);
+  onVoiceControl: (callback) => {
+    const handler = (_event, action) => callback(action);
     ipcRenderer.on('voice-control', handler);
     return () => ipcRenderer.removeListener('voice-control', handler);
   },
@@ -25,21 +63,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getVaultPath: () => ipcRenderer.invoke('get-vault-path'),
   openVault: () => ipcRenderer.invoke('open-vault'),
 
-  onWakeWordDetected: (callback: (...args: any[]) => void) => {
-    const handler = (_event: any, ...args: any) => callback(...args);
+  onWakeWordDetected: (callback) => {
+    const handler = (_event, ...args) => callback(...args);
     ipcRenderer.on('wake-word-detected', handler);
     return () => ipcRenderer.removeListener('wake-word-detected', handler);
   },
 
-  onMainWindowVisibility: (callback: (visible: boolean) => void) => {
-    const handler = (_event: any, visible: boolean) => callback(visible);
+  onMainWindowVisibility: (callback) => {
+    const handler = (_event, visible) => callback(visible);
     ipcRenderer.on('main-window-visibility', handler);
     return () => ipcRenderer.removeListener('main-window-visibility', handler);
   },
 
+  onSwitchView: (callback) => {
+    const handler = (_event, view) => callback(view);
+    ipcRenderer.on('switch-view', handler);
+    return () => ipcRenderer.removeListener('switch-view', handler);
+  },
+
   // OS keychain API key management (uses keytar under the hood)
-  storeApiKey: (keyName: string, value: string) => ipcRenderer.invoke('store-api-key', keyName, value),
-  retrieveApiKey: (keyName: string) => ipcRenderer.invoke('retrieve-api-key', keyName),
+  storeApiKey: (keyName, value) => ipcRenderer.invoke('store-api-key', keyName, value),
+  retrieveApiKey: (keyName) => ipcRenderer.invoke('retrieve-api-key', keyName),
   retrieveApiKeys: () => ipcRenderer.invoke('retrieve-api-keys'),
-  deleteApiKey: (keyName: string) => ipcRenderer.invoke('delete-api-key', keyName),
+  deleteApiKey: (keyName) => ipcRenderer.invoke('delete-api-key', keyName),
 });

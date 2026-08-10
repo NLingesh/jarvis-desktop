@@ -1,0 +1,209 @@
+.proactive-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 12px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.proactive-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.proactive-tab {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.proactive-tab.active {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.proactive-error {
+  font-size: 12px;
+  color: #ff6b6b;
+  text-align: center;
+  padding: 8px;
+}
+
+.proactive-loading,
+.proactive-empty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  text-align: center;
+  padding: 8px;
+}
+
+.proactive-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.proactive-btn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.proactive-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.suggestions-list,
+.notifications-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.suggestion-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.suggestion-item.high {
+  border-color: rgba(255, 107, 107, 0.2);
+}
+
+.suggestion-item.medium {
+  border-color: rgba(255, 193, 7, 0.2);
+}
+
+.suggestion-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.suggestion-type {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.5);
+  text-transform: uppercase;
+}
+
+.suggestion-text {
+  margin: 0;
+  font-size: 13px;
+  color: #fff;
+  line-height: 1.4;
+}
+
+.suggestion-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.suggestion-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.suggestion-btn.accept {
+  background: rgba(76, 175, 80, 0.15);
+  border-color: rgba(76, 175, 80, 0.3);
+}
+
+.suggestion-btn.dismiss {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.notification-create {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notification-input,
+.notification-textarea {
+  width: 100%;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.3);
+  color: #fff;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.notification-textarea {
+  min-height: 60px;
+  resize: vertical;
+}
+
+.notification-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.notification-item.high {
+  border-color: rgba(255, 107, 107, 0.2);
+}
+
+.notification-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.notification-title {
+  font-size: 13px;
+  color: #fff;
+  font-weight: 500;
+}
+
+.notification-priority {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  text-transform: capitalize;
+}
+
+.notification-priority.high {
+  background: rgba(255, 107, 107, 0.2);
+  color: #ff6b6b;
+}
+
+.notification-body {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+  line-height: 1.4;
+}
+
+.notification-time {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+}

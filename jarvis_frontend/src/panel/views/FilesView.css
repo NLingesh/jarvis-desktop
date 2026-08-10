@@ -1,0 +1,212 @@
+.files-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 200px;
+  transition: background 0.2s ease;
+}
+
+.files-view.drag-over {
+  background: rgba(0,255,136,0.04);
+}
+
+.files-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.files-tree {
+  width: 45%;
+  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.files-tree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-3) var(--spacing-4);
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+.files-add-btn {
+  background: rgba(0,255,136,0.1);
+  border: 1px solid var(--color-border);
+  color: var(--color-accent);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-sm);
+  transition: all 0.2s ease;
+}
+
+.files-add-btn:hover {
+  background: rgba(0,255,136,0.2);
+}
+
+.files-tree-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-2);
+}
+
+.file-node {
+  display: flex;
+  flex-direction: column;
+}
+
+.file-folder-btn,
+.file-file-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  padding: var(--spacing-1) var(--spacing-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-folder-btn:hover,
+.file-file-btn:hover {
+  background: rgba(255,255,255,0.04);
+}
+
+.file-folder-btn.selected,
+.file-file-btn.selected {
+  background: rgba(0,255,136,0.06);
+  border-color: var(--color-border-strong);
+}
+
+.file-arrow {
+  font-size: 8px;
+  color: var(--color-text-tertiary);
+  width: 10px;
+  flex-shrink: 0;
+}
+
+.file-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-children {
+  display: flex;
+  flex-direction: column;
+}
+
+.files-preview {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-4);
+  display: flex;
+  flex-direction: column;
+}
+
+.files-preview-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--spacing-3);
+  color: var(--color-text-tertiary);
+}
+
+.files-drop-icon {
+  font-size: 32px;
+  opacity: 0.5;
+}
+
+.files-preview-hint {
+  font-size: var(--text-xs);
+  opacity: 0.7;
+}
+
+.files-preview-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-4);
+}
+
+.files-preview-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+}
+
+.files-preview-icon {
+  font-size: 24px;
+}
+
+.files-preview-name {
+  font-family: var(--font-sans);
+  font-size: var(--text-lg);
+  color: var(--color-text);
+  font-weight: 600;
+  margin: 0;
+}
+
+.files-preview-meta {
+  display: flex;
+  gap: var(--spacing-4);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-sans);
+}
+
+.files-preview-body {
+  background: rgba(0,0,0,0.25);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  max-height: 300px;
+}
+
+.files-preview-placeholder {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .file-folder-btn,
+  .file-file-btn,
+  .files-add-btn {
+    transition-duration: 80ms !important;
+  }
+}

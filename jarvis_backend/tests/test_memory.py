@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 
-from modules.memory import MemoryManager
+from managers.memory_manager import MemoryManager
 
 
 def make_manager(tmp_path):

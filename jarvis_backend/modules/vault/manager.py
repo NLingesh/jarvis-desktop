@@ -455,3 +455,59 @@ class VaultManager:
                     continue
             out.append(meta)
         return out
+
+    # --- Daily notes ----------------------------------------------------------
+    async def create_daily_note(self, date_str: str | None = None) -> dict:
+        """Create or retrieve a daily note for the given date."""
+        from datetime import datetime
+
+        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        folder = "Daily Notes"
+        filename = f"{date_str}.md"
+        rel_path = f"{folder}/{filename}"
+
+        if await asyncio.to_thread(self.store.exists, rel_path):
+            return await self.get_note(rel_path)
+
+        content = f"# {date_str}\n\n## Tasks\n\n## Notes\n\n## Reflections\n"
+        return await self.create_note(
+            title=date_str,
+            folder=folder,
+            note_type="daily",
+            tags=["daily", date_str[:7]],
+            content=content,
+        )
+
+    async def get_daily_notes(self, limit: int = 30) -> list[dict]:
+        """List recent daily notes."""
+        return await self.search_notes(folder="Daily Notes", limit=limit)
+
+    # --- Graph / links --------------------------------------------------------
+    async def get_note_graph(self, limit: int = 100) -> dict:
+        """Build a simple link graph from vault notes."""
+        files = await asyncio.to_thread(self.store.list_files)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        seen_paths: set[str] = set()
+
+        for rel in files:
+            if rel in seen_paths:
+                continue
+            seen_paths.add(rel)
+            try:
+                meta = await self._meta_async(rel)
+                nodes.append(
+                    {
+                        "id": meta.get("id", rel),
+                        "title": meta["title"],
+                        "path": rel,
+                        "type": meta["type"],
+                        "tags": meta["tags"],
+                    }
+                )
+                for link in meta.get("links", []):
+                    edges.append({"source": rel, "target": link})
+            except Exception:
+                continue
+
+        return {"nodes": nodes[:limit], "edges": edges[:limit]}

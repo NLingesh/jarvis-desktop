@@ -3,7 +3,7 @@
 When ``JARVIS_AUTH_ENABLED=true`` every ``/api/*`` route (except login and
 register) requires an ``Authorization: Bearer <token>`` header, and the
 WebSocket handshake requires an ``access_token`` query parameter. Tokens are
-opaque random values stored in SQLite via :class:`modules.memory.MemoryManager`
+opaque random values stored in SQLite via :class:`managers.memory_manager.MemoryManager`
 and expire after ``JARVIS_AUTH_TTL_HOURS`` (default 24).
 
 Passwords are never stored in plain text: they are hashed with PBKDF2-HMAC-SHA256

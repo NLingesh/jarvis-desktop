@@ -19,6 +19,13 @@ A voice-first AI assistant for Linux that integrates with your calendar, email, 
 - 🎯 **NVIDIA Reranking** — Optional semantic reranking for better search results
 - 💻 **Desktop App** — Electron shell with tray, floating bubble, wake-word, and auto-updates
 - 🔒 **Privacy-First** — Conversations stored locally; session-token auth on the WebSocket and API
+- 👁️ **Vision** — Screenshot capture, OCR, image analysis, window awareness
+- 📋 **Task Management** — Create tasks, reminders, and scheduled jobs with cron
+- 🔄 **Automation** — Rule-based workflows with if/then logic
+- 🧠 **Adaptive Intelligence** — Behavior pattern learning and predictive suggestions
+- 🔔 **Proactive AI** — AI-powered proactive suggestions and smart notifications
+- 🛡️ **Security & Privacy** — Fernet encryption, privacy controls, data export/delete
+- 📊 **Performance Monitoring** — Request metrics, latency tracking, system health checks
 
 ## Architecture
 
@@ -199,21 +206,37 @@ Destructive document actions (overwrite, replace, delete) require a spoken confi
 
 | File | Purpose |
 |------|---------|
-| `main.py` | FastAPI app, middleware (CSP, rate-limit), WebSocket `/ws/voice` |
-| `routes/` | REST routers: `system`, `memory`, `mail`, `notes`, `calendar`, `llm`, `stt`, `settings` |
+| `main.py` | FastAPI app, middleware (CSP, rate-limit, performance tracking), WebSocket `/ws/voice` |
+| `routes/` | REST routers: `system`, `memory`, `mail`, `notes`, `calendar`, `llm`, `stt`, `settings`, `vision`, `tasks`, `automation`, `adaptive`, `proactive`, `security`, `performance` |
 | `routes/state.py` | Shared singletons, session-token auth, skill registry wiring, `handle_user_input()` |
+| `routes/deps.py` | Backward-compatible re-exports for tests and legacy imports |
+| `managers/memory_manager.py` | `MemoryManager` — SQLite conversations + FTS5 search, behavior patterns, learning feedback |
+| `managers/conversation_manager.py` | `ConversationManager`, `PreferenceManager`, `ContextManager` |
+| `managers/system_manager.py` | `SystemManager` — system actions and info |
+| `managers/audio_manager.py` | `AudioManager` — audio I/O |
+| `managers/stt_manager.py` | `STTManager` — speech-to-text pipeline |
+| `managers/tts_manager.py` | `TTSManager` — text-to-speech pipeline |
+| `managers/voice_manager.py` | `VoiceManager` — voice pipeline orchestration |
+| `managers/model_manager.py` | `ModelManager` — model routing and selection |
+| `managers/vision_manager.py` | `VisionManager` — screenshot, OCR, image analysis, windows |
+| `managers/task_manager.py` | `TaskManager` — tasks, reminders, scheduled jobs (APScheduler) |
+| `managers/workflow_manager.py` | `WorkflowManager` — rule-based automation workflows |
+| `managers/adaptive_intelligence.py` | `AdaptiveIntelligenceManager` — behavior learning, predictions |
+| `managers/proactive_ai.py` | `ProactiveAIManager` — AI-powered suggestions and notifications |
+| `managers/security_manager.py` | `SecurityManager` — Fernet encryption, privacy controls, data export/delete |
+| `managers/performance_manager.py` | `PerformanceManager` — metrics, latency tracking, system health |
 | `modules/llm_provider.py` | `LLMProvider` — Mistral (streaming) / Anthropic, NVIDIA reranking |
-| `modules/claude_api.py` | Anthropic Claude client (fallback provider) |
-| `modules/stt.py` | `SpeechToTextModule` — offline Vosk with Whisper fallback |
 | `modules/tts.py` | `TextToSpeechModule` — ElevenLabs → Edge TTS → espeak/piper |
-| `modules/memory.py` | `MemoryManager` — SQLite conversations + FTS5 search |
-| `modules/skill_registry.py` | `SkillRegistry` + `Skill` — intent-based command routing |
+| `modules/stt.py` | `SpeechToTextModule` — offline Vosk with Whisper fallback |
 | `modules/calendar_module.py` | Evolution / GNOME Calendar integration |
 | `modules/mail_module.py` | IMAP/SMTP email access |
 | `modules/notes_module.py` | JSON-based note storage |
 | `modules/documents_module.py` | Sandboxed document read/write/edit in `DOCUMENTS_ROOT` |
 | `modules/web_browse.py` | DuckDuckGo search, weather, translation |
 | `modules/system_actions.py` | CPU/memory/disk/process monitoring (psutil) |
+| `modules/audit.py` | Audit logging for security and compliance |
+| `modules/auth.py` | `AuthService` — PBKDF2 password hashing, session tokens, bearer auth |
+| `plugins/` | Plugin system: base, registry, loader, permissions, builtin skills |
 
 ### Frontend — `jarvis_frontend/src/`
 
@@ -224,6 +247,9 @@ Destructive document actions (overwrite, replace, delete) require a spoken confi
 | `components/Settings.tsx` | Configuration panel |
 | `components/Onboarding.tsx` | First-run setup |
 | `bubble.tsx` | Floating desktop bubble UI (`/bubble.html`) |
+| `panel/Panel.tsx` | Main panel with tabbed views |
+| `panel/views/` | Chat, Memory, Files, Models, Plugins, Settings, Tools, Tasks, Automation, Adaptive, Proactive, Security, Performance |
+| `api/` | Typed API clients for all backend routes |
 | `main.tsx` | React entry point |
 
 ### Desktop — `electron/`
@@ -272,7 +298,30 @@ The token is generated at startup (or set via `SESSION_TOKEN` env var). Invalid/
 | `POST` | `/api/llm/rerank` | Rerank passages (NVIDIA) |
 | `POST` | `/api/stt/transcribe` | Transcribe base64 WAV to text |
 | `GET` | `/api/stt/status` | STT availability |
-| `GET/POST` | `/api/settings/keys` | Read/update masked `.env` keys (e.g. MISTRAL_API_KEY) |
+| `GET/POST` | `/api/settings/keys` | Read/update masked `.env` keys |
+| `GET/POST` | `/api/vision/screenshot` | Capture screenshot |
+| `POST` | `/api/vision/ocr` | OCR on base64 image |
+| `POST` | `/api/vision/analyze` | LLM-powered image analysis |
+| `GET` | `/api/vision/windows` | List open windows |
+| `GET/POST` | `/api/tasks/` | List/create tasks, reminders, jobs |
+| `GET/PATCH/DELETE` | `/api/tasks/{id}` | Get/update/delete task |
+| `POST` | `/api/tasks/{id}/complete` | Mark task complete |
+| `GET/POST` | `/api/automation/workflows` | List/create workflows |
+| `POST` | `/api/automation/workflows/{id}/execute` | Execute workflow |
+| `DELETE` | `/api/automation/workflows/{id}` | Delete workflow |
+| `GET` | `/api/adaptive/behavior` | Behavior pattern analysis |
+| `GET` | `/api/adaptive/insights` | Adaptive intelligence insights |
+| `GET` | `/api/adaptive/suggestions` | Predictive suggestions |
+| `POST` | `/api/adaptive/learn` | Learn from interaction |
+| `POST` | `/api/adaptive/feedback` | Record prediction feedback |
+| `GET` | `/api/proactive/suggestions` | Proactive AI suggestions |
+| `POST` | `/api/proactive/notifications` | Create smart notification |
+| `GET` | `/api/security/status` | Security posture |
+| `GET/POST` | `/api/security/privacy` | Privacy settings |
+| `GET` | `/api/security/export` | Export user data |
+| `DELETE` | `/api/security/data` | Delete all user data |
+| `GET` | `/api/performance/metrics` | Request metrics |
+| `GET` | `/api/performance/health` | System health |
 
 Interactive docs: `http://localhost:8000/docs`.
 
@@ -327,6 +376,21 @@ npx prettier --check "src/**/*.{ts,tsx}"
    )
    ```
 3. The LLM receives the skill output in context and answers naturally.
+
+### Add a New Panel View
+
+1. Create a view component in `jarvis_frontend/src/panel/views/`
+2. Export it from `src/panel/views/index.ts`
+3. Add the view type to `PanelView` in `src/panel/Panel.tsx`
+4. Wire it into the `VIEWS` array and the render switch
+
+### Add a New Backend Manager
+
+1. Create a manager in `jarvis_backend/managers/`
+2. Wire the singleton in `routes/state.py`
+3. Add routes in `jarvis_backend/routes/`
+4. Include the router in `main.py`
+5. Add an API client in `jarvis_frontend/src/api/`
 
 ## Troubleshooting
 
