@@ -198,8 +198,21 @@ function App() {
   }, []);
 
   const closePanel = useCallback(() => {
+    if (listeningRef.current || nativeListeningRef.current) {
+      const socket = ws.current;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'stop_listening' }));
+      }
+      nativeListeningRef.current = false;
+      setIsListening(false);
+    }
     setPanelOpen(false);
     setQuickActionsOpen(false);
+    setLiveTranscript('');
+    setAssistantText('');
+    setSheetState('hidden');
+    setIsProcessing(false);
+    setOrbState('idle');
     if (isElectron && windowModeRef.current !== 'orb') {
       getElectronAPI()?.setWindowMode?.('orb');
     }
@@ -212,7 +225,11 @@ function App() {
       setQuickActionsOpen(false);
       setPanelOpen(true);
       if (isElectron && windowModeRef.current !== 'panel') {
-        getElectronAPI()?.setWindowMode?.('panel', orbPositionRef.current.x, orbPositionRef.current.y);
+        getElectronAPI()?.setWindowMode?.(
+          'panel',
+          orbPositionRef.current.x,
+          orbPositionRef.current.y,
+        );
       }
       setWindowMode('panel');
     },
@@ -222,7 +239,11 @@ function App() {
   const toggleQuickActions = useCallback(() => {
     const next = !quickActionsOpen;
     if (isElectron) {
-      getElectronAPI()?.setWindowMode?.(next ? 'menu' : 'orb', orbPositionRef.current.x, orbPositionRef.current.y);
+      getElectronAPI()?.setWindowMode?.(
+        next ? 'menu' : 'orb',
+        orbPositionRef.current.x,
+        orbPositionRef.current.y,
+      );
     }
     setQuickActionsOpen(next);
   }, [isElectron, quickActionsOpen]);
@@ -863,11 +884,17 @@ function App() {
         setError('Not connected to server');
         return;
       }
+      nativeReadyRef.current = false;
       socket.send(JSON.stringify({ type: 'connect', device: settingsRef.current.nativeMicDevice }));
       await new Promise<void>((resolve) => {
+        const start = Date.now();
         const check = () => {
-          if (nativeReadyRef.current) resolve();
-          else setTimeout(check, 100);
+          if (nativeReadyRef.current) return resolve();
+          if (Date.now() - start > 8000) {
+            setError('Microphone connection timed out');
+            return resolve();
+          }
+          setTimeout(check, 100);
         };
         setTimeout(check, 100);
       });
@@ -1081,7 +1108,11 @@ function App() {
         // stream. The orb stays centered under the cursor the whole time.
         if (isElectron) {
           setWindowMode('menu');
-          getElectronAPI()?.setWindowMode?.('menu', orbPositionRef.current.x, orbPositionRef.current.y);
+          getElectronAPI()?.setWindowMode?.(
+            'menu',
+            orbPositionRef.current.x,
+            orbPositionRef.current.y,
+          );
         }
       }
       const start = dragStartPosRef.current;
@@ -1117,7 +1148,12 @@ function App() {
     (action: 'talk' | 'chat' | 'memory' | 'tools') => {
       setQuickActionsOpen(false);
       if (action === 'talk') {
-        if (isElectron) getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
+        if (isElectron)
+          getElectronAPI()?.setWindowMode?.(
+            'orb',
+            orbPositionRef.current.x,
+            orbPositionRef.current.y,
+          );
         toggleTalk();
       } else {
         openPanel(action);
@@ -1160,12 +1196,28 @@ function App() {
   const orbAnchorStyle = useMemo(() => {
     if (isElectron) {
       if (windowMode === 'panel') {
-        return { position: 'absolute' as const, left: PANEL_ANCHOR.x, top: PANEL_ANCHOR.y, transform: 'translate(-50%, -50%)', display: 'none' };
+        return {
+          position: 'absolute' as const,
+          left: PANEL_ANCHOR.x,
+          top: PANEL_ANCHOR.y,
+          transform: 'translate(-50%, -50%)',
+          display: 'none',
+        };
       }
       const anchor = windowMode === 'menu' ? MENU_WINDOW / 2 : ORB_WINDOW / 2;
-      return { position: 'absolute' as const, left: anchor, top: anchor, transform: 'translate(-50%, -50%)' };
+      return {
+        position: 'absolute' as const,
+        left: anchor,
+        top: anchor,
+        transform: 'translate(-50%, -50%)',
+      };
     }
-    return { position: 'absolute' as const, left: orbPosition.x, top: orbPosition.y, transform: 'translate(-50%, -50%)' };
+    return {
+      position: 'absolute' as const,
+      left: orbPosition.x,
+      top: orbPosition.y,
+      transform: 'translate(-50%, -50%)',
+    };
   }, [isElectron, windowMode, orbPosition]);
 
   const showTransientHud = !isElectron || windowMode === 'panel';
@@ -1173,7 +1225,11 @@ function App() {
   return (
     <ToastProvider>
       <ErrorBoundary>
-        <div className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''}`} role="main" aria-label="JARVIS Voice Assistant">
+        <div
+          className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''}`}
+          role="main"
+          aria-label="JARVIS Voice Assistant"
+        >
           {showOnboarding && (panelOpen || !isElectron) && (
             <div className="onboarding-overlay" aria-hidden={!showOnboarding}>
               <div className="onboarding-panel">

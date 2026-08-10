@@ -81,10 +81,13 @@ const Panel: React.FC<PanelProps> = ({
   const { state: choreography, position } = usePanelChoreography(open, orbPosition);
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [dragPosition, setDragPosition] = useState<{ x: number; y: number } | null>(null);
   const [graceTimer, setGraceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
   const lastClickTime = useRef(0);
+  const dragPositionRef = useRef<{ x: number; y: number } | null>(null);
+  const isDraggingRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -100,21 +103,39 @@ const Panel: React.FC<PanelProps> = ({
   const handleDragStart = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
       if ((e.target as HTMLElement).closest('button, input, select, a, [role="button"]')) return;
+      if (fillWindow) return;
       e.preventDefault();
       e.stopPropagation();
       const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
       const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
+      const startX = clientX - (dragPosition ?? position).x;
+      const startY = clientY - (dragPosition ?? position).y;
+      setDragOffset({ x: startX, y: startY });
       setIsDragging(true);
-      setDragOffset({ x: clientX - position.x, y: clientY - position.y });
+      isDraggingRef.current = true;
     },
-    [position],
+    [position, dragPosition, fillWindow],
   );
 
   useEffect(() => {
     if (!isDragging) return;
-    const handleMove = (_e: MouseEvent | TouchEvent) => {};
+    const handleMove = (e: MouseEvent | TouchEvent) => {
+      const clientX =
+        'touches' in e ? (e as TouchEvent).touches[0].clientX : (e as MouseEvent).clientX;
+      const clientY =
+        'touches' in e ? (e as TouchEvent).touches[0].clientY : (e as MouseEvent).clientY;
+      const next = {
+        x: Math.round(clientX - dragOffset.x),
+        y: Math.round(clientY - dragOffset.y),
+      };
+      dragPositionRef.current = next;
+      setDragPosition(next);
+    };
     const handleUp = () => {
+      isDraggingRef.current = false;
       setIsDragging(false);
+      setDragPosition(null);
+      dragPositionRef.current = null;
     };
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleUp);
@@ -176,8 +197,8 @@ const Panel: React.FC<PanelProps> = ({
         ref={panelRef}
         className={`panel ${className || ''} ${isDragging ? 'dragging' : ''} ${fillWindow ? 'panel-fill' : ''}`}
         style={{
-          left: fillWindow ? 0 : position.x,
-          top: fillWindow ? 0 : position.y,
+          left: fillWindow ? 0 : (dragPosition ?? position).x,
+          top: fillWindow ? 0 : (dragPosition ?? position).y,
           width: fillWindow ? '100%' : 'var(--panel-width)',
           maxWidth: fillWindow ? 'none' : 'var(--panel-max-width)',
           maxHeight: fillWindow ? 'none' : 'var(--panel-max-height)',
