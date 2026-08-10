@@ -12,6 +12,7 @@ import re
 import secrets
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -52,6 +53,21 @@ from modules.vision_module import VisionModule
 from modules.web_browse import WebBrowseModule
 from plugins.permissions import PermissionManager
 from plugins.registry import PluginRegistry
+from tools import ToolRegistry
+from tools.app_tools import LaunchAppTool, OpenTerminalTool
+from tools.desktop_tools import CloseAppTool, ScreenshotTool
+from tools.document_tools import ReadDocumentTool
+from tools.file_tools import (
+    FileSearchTool,
+    ListDirectoryTool,
+    OpenFileTool,
+    OpenFolderTool,
+    ReadFileTool,
+)
+from tools.memory_tools import RecallMemoryTool, RememberMemoryTool
+from tools.shell_tools import ExecuteShellTool
+from tools.system_tools import RunningProcessesTool, SystemInfoTool
+from tools.web_tools import WebSearchTool
 
 logger = logging.getLogger("jarvis")
 
@@ -221,6 +237,24 @@ proactive_ai = ProactiveAIManager(llm, memory_manager, adaptive_intelligence)
 
 plugin_registry = PluginRegistry()
 permission_manager = PermissionManager()
+
+tool_registry = ToolRegistry()
+tool_registry.register(SystemInfoTool())
+tool_registry.register(RunningProcessesTool())
+tool_registry.register(LaunchAppTool())
+tool_registry.register(OpenTerminalTool())
+tool_registry.register(CloseAppTool())
+tool_registry.register(ScreenshotTool())
+tool_registry.register(FileSearchTool())
+tool_registry.register(ListDirectoryTool())
+tool_registry.register(ReadFileTool())
+tool_registry.register(OpenFileTool())
+tool_registry.register(OpenFolderTool())
+tool_registry.register(ExecuteShellTool())
+tool_registry.register(WebSearchTool())
+tool_registry.register(ReadDocumentTool())
+tool_registry.register(RememberMemoryTool())
+tool_registry.register(RecallMemoryTool())
 
 # --- Markdown vault ---------------------------------------------------------
 MEMORY_VAULT_PATH = os.getenv("MEMORY_VAULT_PATH") or os.path.join(
@@ -651,6 +685,67 @@ async def stream_speech_to_socket(websocket, text: str, voice_uid: str) -> None:
         await _stream_sentence_audio(websocket, sentence, voice_uid)
 
 
+async def _route_tools(user_input: str, session_id: str) -> dict | None:
+    """Match natural-language input to tools and execute them when confident."""
+    lower = user_input.lower()
+    tool_results: dict = {}
+
+    async def _maybe(tool_name: str, args: dict) -> None:
+        result = await tool_registry.execute_tool(tool_name, args)
+        tool_results[tool_name] = result.to_dict()
+
+    if any(k in lower for k in ["cpu", "memory", "disk", "uptime", "gpu", "processes", "system info", "status"]):
+        await _maybe("system_info", {"query": lower})
+    elif "launch " in lower or "open " in lower:
+        app = lower.split("open ")[-1].split("launch ")[-1].strip()
+        await _maybe("launch_app", {"app": app})
+    elif "terminal" in lower and ("open" in lower or "launch" in lower):
+        await _maybe("open_terminal", {})
+    elif "close" in lower:
+        app = lower.replace("close", "").strip()
+        await _maybe("close_app", {"app": app})
+    elif "screenshot" in lower:
+        await _maybe("screenshot", {})
+    elif any(k in lower for k in ["find file", "search file", "locate file"]):
+        query = re.sub(r"(find|search|locate)\s+(file|files)\s*(named|called)?\s*", "", lower).strip()
+        await _maybe("file_search", {"query": query, "directory": str(Path.home())})
+    elif "list files" in lower or "list directory" in lower or "what files" in lower:
+        await _maybe("list_directory", {"path": str(Path.home())})
+    elif "read file" in lower or "open file" in lower:
+        path = re.sub(r"(read|open)\s+(the\s+)?file\s+", "", lower).strip().strip("\"'")
+        await _maybe("read_file", {"path": path})
+    elif "open folder" in lower or "open downloads" in lower or "open documents" in lower:
+        path_map = {
+            "downloads": os.path.expanduser("~/Downloads"),
+            "documents": os.path.expanduser("~/Documents"),
+            "home": os.path.expanduser("~"),
+            "desktop": os.path.expanduser("~/Desktop"),
+            "pictures": os.path.expanduser("~/Pictures"),
+        }
+        for key, val in path_map.items():
+            if key in lower:
+                await _maybe("open_folder", {"path": val})
+                break
+    elif "run " in lower or "execute " in lower:
+        cmd = re.sub(r"^(run|execute)\s+", "", lower).strip()
+        await _maybe("execute_shell", {"command": cmd})
+    elif "web search" in lower or "search web" in lower or "look up" in lower:
+        query = re.sub(r"(web\s+search|search\s+web|look\s+up)\s+(for\s+)?", "", lower).strip()
+        await _maybe("web_search", {"query": query})
+    elif "read document" in lower or "summarize" in lower or "summarise" in lower:
+        path = re.sub(r"(read|summarize|summarise)\s+(document|file|pdf)?\s*", "", lower).strip().strip("\"'")
+        await _maybe("read_document", {"path": path})
+    elif "remember " in lower:
+        fact = re.sub(r"^remember\s+(that\s+)?", "", lower).strip().strip(".")
+        await _maybe("remember_memory", {"fact": fact})
+    elif "what do you remember" in lower or "recall" in lower:
+        await _maybe("recall_memory", {"query": lower})
+
+    if tool_results:
+        return {"tool_results": tool_results}
+    return None
+
+
 async def handle_user_input(
     user_input: str, session_id: str, websocket, voice_uid: str = ""
 ) -> None:
@@ -669,6 +764,11 @@ async def handle_user_input(
 
     try:
         context = await process_command(user_input, session_id=session_id)
+
+        tool_result = await _route_tools(user_input, session_id)
+        if tool_result:
+            context.setdefault("tools", {})
+            context["tools"].update(tool_result)
 
         context_manager_result = await context_manager.build_context(
             session_id=session_id, query=user_input

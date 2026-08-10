@@ -29,7 +29,10 @@ body {
 
 .app-electron.orb-mode {
   background: transparent;
-  --orb-size: 80px;
+}
+
+.app-electron.orb-mode body {
+  background: transparent;
 }
 
 .app-electron.panel-mode {

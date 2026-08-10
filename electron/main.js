@@ -530,13 +530,9 @@ function buildOrbContextMenu() {
   const { Menu } = require('electron');
   const template = [
     { label: 'Talk', click: () => sendToRenderer('context-menu-action', 'talk') },
-    { label: 'Chat', click: () => sendToRenderer('context-menu-action', 'chat') },
-    { label: 'Memory', click: () => sendToRenderer('context-menu-action', 'memory') },
-    { label: 'Files', click: () => sendToRenderer('context-menu-action', 'files') },
+    { label: 'Pause', click: () => sendToRenderer('context-menu-action', 'pause') },
     { type: 'separator' },
     { label: 'Settings', click: () => sendToRenderer('context-menu-action', 'settings') },
-    { label: 'Models', click: () => sendToRenderer('context-menu-action', 'models') },
-    { label: 'Plugins', click: () => sendToRenderer('context-menu-action', 'plugins') },
     { type: 'separator' },
     {
       label: 'Quit',
