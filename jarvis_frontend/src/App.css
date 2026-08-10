@@ -27,6 +27,11 @@ body {
   -webkit-user-select: none;
 }
 
+.app-electron.orb-mode {
+  background: transparent;
+  --orb-size: 80px;
+}
+
 .app-electron.panel-mode {
   background: #0a0e27;
 }

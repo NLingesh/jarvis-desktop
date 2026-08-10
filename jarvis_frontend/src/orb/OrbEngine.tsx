@@ -472,9 +472,9 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
         if (moved) onDragEnd?.();
+        setIsDragging(false);
         setTimeout(
           () => {
-            setIsDragging(false);
             setDragScale(1);
           },
           reducedMotion ? 80 : 400,

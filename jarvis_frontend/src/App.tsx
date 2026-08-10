@@ -240,18 +240,6 @@ function App() {
     [isElectron],
   );
 
-  const toggleQuickActions = useCallback(() => {
-    const next = !quickActionsOpen;
-    if (isElectron) {
-      getElectronAPI()?.setWindowMode?.(
-        next ? 'menu' : 'orb',
-        orbPositionRef.current.x,
-        orbPositionRef.current.y,
-      );
-    }
-    setQuickActionsOpen(next);
-  }, [isElectron, quickActionsOpen]);
-
   const closeQuickActions = useCallback(() => {
     if (quickActionsOpen && isElectron) {
       getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
@@ -1244,7 +1232,7 @@ function App() {
     <ToastProvider>
       <ErrorBoundary>
         <div
-          className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''}`}
+          className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''} ${isElectron && windowMode === 'orb' ? 'orb-mode' : ''}`}
           role="main"
           aria-label="JARVIS Voice Assistant"
         >
@@ -1269,20 +1257,20 @@ function App() {
               className={`orb-anchor ${isListening ? 'recording' : ''} ${windowMode === 'panel' ? 'orb-anchor-hidden' : ''}`}
               style={orbAnchorStyle as React.CSSProperties}
             >
-              <OrbEngine
-                state={effectiveOrbState}
-                rms={rms}
-                onToggleTalk={toggleTalk}
-                onExpandPanel={() => openPanel()}
-                onSingleClick={toggleQuickActions}
-                onQuickAction={handleQuickAction}
-                onClick={handlePanelClose}
-                onDragMove={handleOrbDragMove}
-                onDragEnd={handleOrbDragEnd}
-                onContextMenu={handleOrbContextMenu}
-                quickActionsOpen={quickActionsOpen}
-                onCloseQuickActions={closeQuickActions}
-              />
+               <OrbEngine
+                 state={effectiveOrbState}
+                 rms={rms}
+                 onToggleTalk={toggleTalk}
+                 onExpandPanel={() => openPanel()}
+                 onSingleClick={openPanel}
+                 onQuickAction={handleQuickAction}
+                 onClick={handlePanelClose}
+                 onDragMove={handleOrbDragMove}
+                 onDragEnd={handleOrbDragEnd}
+                 onContextMenu={handleOrbContextMenu}
+                 quickActionsOpen={quickActionsOpen}
+                 onCloseQuickActions={closeQuickActions}
+               />
             </div>
 
             {showTransientHud && (
