@@ -29,3 +29,4 @@ jarvis_backend/models/
 release/
 .env.odt
 *.wav
+.aider*

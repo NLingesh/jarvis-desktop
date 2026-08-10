@@ -21,6 +21,16 @@ body {
   position: relative;
 }
 
+.app-electron {
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.app-electron.panel-mode {
+  background: #0a0e27;
+}
+
 .app-main {
   flex: 1;
   position: relative;
@@ -34,6 +44,10 @@ body {
 
 .orb-anchor.recording .orb-engine {
   filter: brightness(1.1);
+}
+
+.orb-anchor-hidden {
+  display: none !important;
 }
 
 .orb-hint {
