@@ -5,7 +5,7 @@ import { describeMicError, logVoice } from './voiceDiagnostics';
 import { useAutonomousBehaviors } from './orb/useAutonomousBehaviors';
 import './bubble.css';
 
-type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking';
+type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'offline';
 const DEFAULT_WAKE_WORD = 'computer';
 const WAKE_COOLDOWN_MS = 2000;
 const WAKE_PING_INTERVAL_MS = 25000;

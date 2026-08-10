@@ -23,7 +23,7 @@ const MENU_WINDOW = 240;
 const PANEL_ANCHOR = { x: 190, y: 520 };
 const ORB_POSITION_KEY = 'jarvisOrbPosition';
 
-type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'panel-open';
+type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error' | 'panel-open' | 'offline';
 type WindowMode = 'orb' | 'menu' | 'panel';
 const ENDPOINT_RMS_THRESHOLD = 500;
 const ENDPOINT_SILENCE_MS = 900;
@@ -162,6 +162,8 @@ function App() {
   settingsRef.current = settings;
   const orbPositionRef = useRef(orbPosition);
   orbPositionRef.current = orbPosition;
+  const orbStateRef = useRef<OrbState>('idle');
+  orbStateRef.current = orbState;
   const windowModeRef = useRef<WindowMode>('orb');
   windowModeRef.current = windowMode;
   const stopManualRecordingRef = useRef<() => Promise<void>>(async () => {});
@@ -212,7 +214,9 @@ function App() {
     setAssistantText('');
     setSheetState('hidden');
     setIsProcessing(false);
-    setOrbState('idle');
+    if (orbStateRef.current !== 'offline') {
+      setOrbState('idle');
+    }
     if (isElectron && windowModeRef.current !== 'orb') {
       getElectronAPI()?.setWindowMode?.('orb');
     }
@@ -327,6 +331,17 @@ function App() {
       tts,
       llm,
     });
+    if (!result.ok) {
+      if (orbStateRef.current === 'idle' || orbStateRef.current === 'offline') {
+        setOrbState('offline');
+      }
+      if (result.error) {
+        setError(result.error);
+      }
+    } else if (orbStateRef.current === 'offline') {
+      setOrbState('idle');
+      setError(null);
+    }
   }, [settings.serverUrl]);
 
   const tryGetUserMedia = async (constraints: MediaStreamConstraints): Promise<MediaStream> => {
@@ -411,6 +426,9 @@ function App() {
           awaitingPongRef.current = false;
           setError(null);
           reconnectDelay = 1000;
+          if (orbStateRef.current === 'offline') {
+            setOrbState('idle');
+          }
           _setVoiceMachineState((prev) => transition(prev, 'ws_open', getVoiceContext()));
           logVoice('ws_ready');
           if (settingsRef.current.voiceMode === 'native') {

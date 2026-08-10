@@ -5,7 +5,7 @@ import { useMicroMovements } from '../orb/useMicroMovements';
 import { useParticleMemory } from '../orb/useParticleMemory';
 
 interface VoiceOrbProps {
-  state: 'idle' | 'listening' | 'thinking' | 'speaking';
+  state: 'idle' | 'listening' | 'thinking' | 'speaking' | 'offline';
   analysers: AnalyserNode[];
   isError?: boolean;
   isPanelOpen?: boolean;
