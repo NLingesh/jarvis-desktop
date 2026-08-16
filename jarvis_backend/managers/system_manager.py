@@ -22,6 +22,14 @@ from modules.system_actions import ALLOWED_COMMANDS, SystemActions
 logger = logging.getLogger(__name__)
 
 
+def _within(p: Path, base: Path) -> bool:
+    """Prefix-safe containment check (avoids /home/user matching /home/user2)."""
+    try:
+        return os.path.commonpath([str(p), str(base)]) == str(base)
+    except ValueError:
+        return False
+
+
 class SystemManager:
     """Unified system control with safety gates."""
 
@@ -46,14 +54,33 @@ class SystemManager:
         )
         return {"command": command, "output": output}
 
-    async def open_application(self, app_name: str, confirm: bool = False) -> dict:
-        """Open an application."""
+    async def open_application(
+        self, app_name: str, confirm: bool = False, timeout: float = 15.0
+    ) -> dict:
+        """Open an application.
+
+        Awaits the underlying async action so the result reflects whether the
+        launch actually succeeded (previously the coroutine was never awaited,
+        so every call reported success). Returns a typed failure dict otherwise.
+        """
         if not confirm:
             return {"error": "confirm=true is required for opening applications"}
 
-        success = await asyncio.to_thread(self.actions.open_application, app_name)
+        try:
+            success = await asyncio.wait_for(
+                self.actions.open_application(app_name), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            await self._audit("apps.open", app_name, "timeout")
+            return {"error": f"Timed out opening {app_name}", "reason": "timeout"}
+        except Exception as e:
+            await self._audit("apps.open", app_name, f"error: {e}")
+            return {"error": f"Failed to open {app_name}", "reason": "launch_error"}
+
         await self._audit("apps.open", app_name, "success" if success else "failed")
-        return {"opened": app_name} if success else {"error": f"Failed to open {app_name}"}
+        if not success:
+            return {"error": f"Failed to open {app_name}", "reason": "launch_failed"}
+        return {"opened": app_name}
 
     async def close_application(
         self, app_name: str = "", pid: int = 0, confirm: bool = False
@@ -70,9 +97,12 @@ class SystemManager:
 
         try:
             if pid:
-                os.kill(int(pid), 9)
-                await self._audit("apps.close", str(pid), "success")
-                return {"closed": str(pid)}
+                pid_int = int(pid)
+                if pid_int <= 1 or pid_int == os.getpid():
+                    return {"error": "Refusing to kill a protected process"}
+                os.kill(pid_int, 9)
+                await self._audit("apps.close", str(pid_int), "success")
+                return {"closed": str(pid_int)}
 
             if not app_name:
                 return {"error": "app_name is required when pid is not provided"}
@@ -101,7 +131,7 @@ class SystemManager:
 
         p = Path(path).expanduser().resolve()
         base = Path(os.getenv("ALLOWED_FILE_BASE", os.path.expanduser("~"))).resolve()
-        if not str(p).startswith(str(base)):
+        if not _within(p, base):
             return {"error": "Path outside allowed scope"}
 
         if not p.exists():
@@ -128,7 +158,7 @@ class SystemManager:
         src = Path(old_path).expanduser().resolve()
         dst = Path(new_path).expanduser().resolve()
         base = Path(os.getenv("ALLOWED_FILE_BASE", os.path.expanduser("~"))).resolve()
-        if not str(src).startswith(str(base)) or not str(dst).startswith(str(base)):
+        if not _within(src, base) or not _within(dst, base):
             return {"error": "Path outside allowed scope"}
 
         if not src.exists():
@@ -154,7 +184,7 @@ class SystemManager:
 
         p = Path(path).expanduser().resolve()
         base = Path(os.getenv("ALLOWED_FILE_BASE", os.path.expanduser("~"))).resolve()
-        if not str(p).startswith(str(base)):
+        if not _within(p, base):
             return {"error": "Path outside allowed scope"}
 
         try:

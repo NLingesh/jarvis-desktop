@@ -222,3 +222,59 @@ def test_diagnostics_shape(fake_audio):
     assert d["state"] == "READY"
     assert "mic" in d and "vad" in d and "mode" in d
     s.disconnect()
+
+
+# -- Regression: consumer-thread lifecycle -----------------------------------
+# ``mic_test`` used to spawn a consumer thread without the alive-check that
+# ``connect`` had, so a session reused across a mic test + connect (or a
+# reconnect after the stream was reopened) could end up with two consumers
+# draining the same queue.  These tests pin the guarded ``_start_consumer``.
+
+
+def test_no_duplicate_consumer_thread_on_reconnect(fake_audio):
+    from managers.native_voice import NativeVoiceSession
+
+    s = NativeVoiceSession()
+    s.connect()
+    first = s._consumer_thread
+    assert first is not None and first.is_alive()
+
+    # A guarded re-start while the consumer is alive must not spawn a second.
+    s._start_consumer()
+    assert s._consumer_thread is first
+
+    s.disconnect()
+    assert not first.is_alive()
+    s.connect()
+    second = s._consumer_thread
+    assert second is not None and second.is_alive()
+    assert second is not first
+    s.disconnect()
+    assert not second.is_alive()
+
+
+def test_mic_test_and_connect_share_single_consumer(fake_audio):
+    from managers.native_voice import NativeVoiceSession
+
+    s = NativeVoiceSession()
+    assert s.mic_test() is True
+    consumer = s._consumer_thread
+    assert consumer is not None and consumer.is_alive()
+
+    # connect() on an already-running session must reuse the existing consumer.
+    assert s.connect() is True
+    assert s._consumer_thread is consumer
+    s.disconnect()
+    assert not consumer.is_alive()
+
+
+def test_disconnect_stops_consumer_thread(fake_audio):
+    from managers.native_voice import NativeVoiceSession
+
+    s = NativeVoiceSession()
+    s.connect()
+    t = s._consumer_thread
+    assert t is not None and t.is_alive()
+    s.disconnect()
+    t.join(timeout=2.0)
+    assert not t.is_alive()

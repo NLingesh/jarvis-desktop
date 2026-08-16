@@ -10,12 +10,6 @@ from routes.state import (
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 
-@router.get("/{session_id}")
-async def get_memory(session_id: str):
-    """Retrieve conversation history for a session"""
-    return {"conversation": await memory_manager.get_conversation(session_id)}
-
-
 # --- Projects ---------------------------------------------------------------
 @router.get("/projects")
 async def list_projects(request: Request):
@@ -133,8 +127,12 @@ async def delete_task(task_id: str, request: Request):
 @router.get("/knowledge")
 async def list_knowledge(request: Request):
     require_session_token(request)
-    q = request.query_params.get("q", "")
-    return {"knowledge": await memory_manager.list_knowledge(q=q)}
+    k_type = request.query_params.get("type")
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    return {"knowledge": await memory_manager.list_knowledge(k_type=k_type, limit=limit)}
 
 
 @router.post("/knowledge")
@@ -146,7 +144,7 @@ async def create_knowledge(request: Request):
         raise HTTPException(status_code=400, detail="content is required")
     item = await memory_manager.create_knowledge(
         content=content,
-        type=body.get("type", "note"),
+        k_type=body.get("type", "note"),
         source=body.get("source"),
     )
     return item
@@ -281,12 +279,33 @@ async def infer_preferences(session_id: str, request: Request):
 
 
 # --- Vault daily notes -------------------------------------------------------
+def _validate_daily_note_date(date_str: str) -> str:
+    """Validate a daily-note date string; return a canonical YYYY-MM-DD."""
+    import datetime as _dt
+
+    value = (date_str or "").strip()
+    if not value:
+        return _dt.date.today().isoformat()
+    try:
+        parsed = _dt.date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid date; expected YYYY-MM-DD"
+        ) from None
+    return parsed.isoformat()
+
+
 @router.get("/vault/daily-notes")
 async def get_daily_notes(request: Request):
     require_session_token(request)
     from routes.state import vault
 
-    notes = await vault.get_daily_notes(limit=30)
+    try:
+        notes = await vault.get_daily_notes(limit=30)
+    except Exception:
+        raise HTTPException(
+            status_code=500, detail="Failed to list daily notes"
+        ) from None
     return {"daily_notes": notes}
 
 
@@ -296,8 +315,13 @@ async def create_daily_note(request: Request):
     from routes.state import vault
 
     body = await request.json()
-    date_str = body.get("date")
-    note = await vault.create_daily_note(date_str)
+    date_str = _validate_daily_note_date(body.get("date"))
+    try:
+        note = await vault.create_daily_note(date_str)
+    except Exception:
+        raise HTTPException(
+            status_code=500, detail="Failed to create daily note"
+        ) from None
     return note
 
 
@@ -308,3 +332,14 @@ async def get_vault_graph(request: Request):
 
     graph = await vault.get_note_graph(limit=200)
     return graph
+
+
+@router.get("/{session_id}")
+async def get_memory(session_id: str):
+    """Retrieve conversation history for a session.
+
+    Declared last so the static routes above (``/projects``, ``/tasks``,
+    ``/knowledge``, ``/preferences``, ``/search``, ``/summaries``,
+    ``/vault/*``) are matched first instead of being shadowed.
+    """
+    return {"conversation": await memory_manager.get_conversation(session_id)}

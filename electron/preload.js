@@ -86,4 +86,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   retrieveApiKey: (keyName) => ipcRenderer.invoke('retrieve-api-key', keyName),
   retrieveApiKeys: () => ipcRenderer.invoke('retrieve-api-keys'),
   deleteApiKey: (keyName) => ipcRenderer.invoke('delete-api-key', keyName),
+
+  getAutostartEnabled: () => ipcRenderer.invoke('get-autostart-enabled'),
+  setAutostartEnabled: (enabled) => ipcRenderer.invoke('set-autostart-enabled', enabled),
+  getStartMinimized: () => ipcRenderer.invoke('get-start-minimized'),
+  setStartMinimized: (enabled) => ipcRenderer.invoke('set-start-minimized', enabled),
 });

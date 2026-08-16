@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - depends on install
     kokoro = None  # type: ignore[assignment]
     KOKORO_AVAILABLE = False
 
-DEFAULT_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+DEFAULT_VOICE = os.getenv("KOKORO_VOICE", "am_adam")
 DEFAULT_LANG = os.getenv("KOKORO_LANG", "a")
 SAMPLE_RATE = 24000
 

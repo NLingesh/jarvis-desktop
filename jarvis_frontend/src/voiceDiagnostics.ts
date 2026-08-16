@@ -128,8 +128,11 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, message: s
 
 /** Normalize a user-provided server address into a base URL (http scheme). */
 export function toBaseUrl(server: string): string {
+  if (typeof window !== 'undefined' && (window as any).electronAPI) {
+    return window.location.origin;
+  }
   const trimmed = (server || '').trim().replace(/\/*$/, '');
-  if (!trimmed) return 'http://localhost:8000';
+  if (!trimmed) return 'http://127.0.0.1:8000';
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   return `http://${trimmed}`;
 }

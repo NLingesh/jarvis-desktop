@@ -4,6 +4,7 @@ Sounddevice and Silero are mocked so tests run headless; the STT manager is
 stubbed so no real transcription happens.
 """
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 
@@ -216,3 +217,120 @@ def test_native_ws_mic_test_lifecycle(client):
         ws.send_json({"type": "mic_test_stop"})
         msg = _receive_until(ws, "mic_test")
         assert msg["status"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Preflight diagnostics: local mic failures must map to clear messages.
+# ---------------------------------------------------------------------------
+def test_pcm_level_empty():
+    import main as main_mod
+
+    assert main_mod._pcm_level(b"") == (0.0, 0.0)
+
+
+def test_pcm_level_tone():
+    import array
+
+    import numpy as np
+
+    import main as main_mod
+
+    tone = (np.sin(2 * np.pi * 440 * np.arange(16000) / 16000) * 0.5 * 32767).astype(np.int16)
+    pcm = array.array("h", tone).tobytes()
+    rms, peak = main_mod._pcm_level(pcm)
+    assert 0.3 < rms < 0.5
+    assert peak > 0.4
+
+
+def test_pcm_level_silence():
+    import main as main_mod
+
+    assert main_mod._pcm_level(b"\x00\x00" * 8000) == (0.0, 0.0)
+
+
+def test_native_connect_message_mapping(client):
+    import main as main_mod
+
+    session = SimpleNamespace(mic=SimpleNamespace(device_info=lambda: {"id": 0}))
+    assert main_mod._native_connect_message("no input device available", session) == "No microphone detected."
+    assert main_mod._native_connect_message("sounddevice not available", session) == "No microphone detected."
+    assert main_mod._native_connect_message("Invalid sample rate for device", session) == "No microphone detected."
+    assert "Could not open" in main_mod._native_connect_message("some odd failure", session)
+
+
+def test_native_transcribe_silence_reports_no_signal(client, monkeypatch):
+    """Silent audio with STT returning '' must report 'No usable microphone
+    signal detected.' instead of a generic error."""
+    import main as main_mod
+
+    sent = []
+
+    class FakeWS:
+        async def send_json(self, payload):
+            sent.append(payload)
+
+    class FakeMic:
+        def device_info(self):
+            return {"id": 0}
+
+    session = SimpleNamespace(mic=FakeMic())
+    result = asyncio.run(main_mod._native_transcribe(session, b"\x00\x00" * 16000, FakeWS(), "t"))
+    assert result == ""
+    assert sent and sent[0]["type"] == "error"
+    assert sent[0]["message"] == "No usable microphone signal detected."
+
+
+def test_native_transcribe_speech_no_text_reports_no_speech(client, monkeypatch):
+    """Audible audio with STT returning '' must report 'Audio received, but no
+    speech was recognized.'."""
+    import array
+
+    import numpy as np
+
+    import main as main_mod
+
+    sent = []
+
+    class FakeWS:
+        async def send_json(self, payload):
+            sent.append(payload)
+
+    class FakeMic:
+        def device_info(self):
+            return {"id": 0}
+
+    tone = (np.sin(2 * np.pi * 440 * np.arange(16000) / 16000) * 0.5 * 32767).astype(np.int16)
+    pcm = array.array("h", tone).tobytes()
+    session = SimpleNamespace(mic=FakeMic())
+    result = asyncio.run(main_mod._native_transcribe(session, pcm, FakeWS(), "t"))
+    assert result == ""
+    assert sent and sent[0]["type"] == "error"
+    assert sent[0]["message"] == "Audio received, but no speech was recognized."
+
+
+def test_native_transcribe_muted_reports_muted(client, monkeypatch):
+    """A muted source must report 'Microphone is muted.' even with audio."""
+    import array
+
+    import numpy as np
+
+    import main as main_mod
+
+    sent = []
+
+    class FakeWS:
+        async def send_json(self, payload):
+            sent.append(payload)
+
+    class FakeMic:
+        def device_info(self):
+            return {"id": 0}
+
+    monkeypatch.setattr(main_mod, "_source_muted", lambda session: True)
+
+    tone = (np.sin(2 * np.pi * 440 * np.arange(16000) / 16000) * 0.5 * 32767).astype(np.int16)
+    pcm = array.array("h", tone).tobytes()
+    session = SimpleNamespace(mic=FakeMic())
+    result = asyncio.run(main_mod._native_transcribe(session, pcm, FakeWS(), "t"))
+    assert result == ""
+    assert sent and sent[0]["message"] == "Microphone is muted."

@@ -18,6 +18,8 @@ ALLOWED_APPS = {
 
 
 class LaunchAppTool(BaseTool):
+    risk_level = "reversible"
+    capability = "applications"
     name = "launch_app"
     description = "Launch an allowed desktop application by name"
     parameters = {
@@ -40,17 +42,27 @@ class LaunchAppTool(BaseTool):
 
 
 class OpenTerminalTool(BaseTool):
+    risk_level = "reversible"
+    capability = "applications"
     name = "open_terminal"
     description = "Open a new terminal window"
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Optional command to run", "default": ""},
+            "command": {
+                "type": "string",
+                "description": "Ignored: terminals are opened interactively; command execution is not supported.",
+                "default": "",
+            },
         },
     }
 
     async def execute(self, arguments: dict, context: dict | None = None) -> ToolResult:
-        command = arguments.get("command", "")
+        # Intentionally no command execution: opening a terminal with an arbitrary
+        # command string (`-e bash -lc <command>`) is equivalent to arbitrary
+        # shell execution and would bypass the execute_shell allowlist.  Only
+        # open an interactive terminal window.
+        command = (arguments.get("command") or "").strip()
         terminals = ["alacritty", "kitty", "konsole", "gnome-terminal", "xterm"]
         chosen = None
         for term in terminals:
@@ -61,9 +73,8 @@ class OpenTerminalTool(BaseTool):
             return ToolResult(False, error="No supported terminal emulator found")
         try:
             if command:
-                subprocess.Popen([chosen, "-e", "bash", "-lc", command])
-            else:
-                subprocess.Popen([chosen])
+                logger.info("open_terminal: ignoring command argument (execution disabled)")
+            subprocess.Popen([chosen])
             return ToolResult(True, data={"terminal": chosen})
         except Exception as exc:
             return ToolResult(False, error=str(exc))

@@ -91,8 +91,8 @@ describe('toBaseUrl', () => {
     expect(toBaseUrl('localhost:8000///')).toBe('http://localhost:8000');
   });
 
-  it('defaults to localhost', () => {
-    expect(toBaseUrl('')).toBe('http://localhost:8000');
+  it('defaults to loopback', () => {
+    expect(toBaseUrl('')).toBe('http://127.0.0.1:8000');
   });
 });
 

@@ -19,6 +19,8 @@ start.sh
 jarvis_memory.db
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
 .vite/
 *.tsbuildinfo

@@ -35,6 +35,10 @@ class FakeMailSession:
 class FakeVault:
     def __init__(self):
         self.notes: dict[str, str] = {}
+        self.store = self
+
+    def exists(self, path):
+        return path in self.notes
 
     async def get_note(self, path):
         if path not in self.notes:
@@ -42,7 +46,7 @@ class FakeVault:
         return {"body": self.notes[path]}
 
     async def create_note(self, **kwargs):
-        path = f"{kwargs['folder']}/{kwargs['title'].lower()}.md"
+        path = f"{kwargs['folder']}/{kwargs['title']}.md"
         self.notes[path] = kwargs["content"]
         return {"body": kwargs["content"]}
 
@@ -110,7 +114,7 @@ async def test_proactive_no_findings_returns_none():
 async def test_remember_appends_to_profile_note(fake_vault):
     ctx = await state.process_command("remember that I like dark mode")
     assert ctx["profile"]["action"] == "remembered"
-    assert "dark mode" in fake_vault.notes["People/me.md"]
+    assert "dark mode" in fake_vault.notes["People/Me.md"]
 
 
 async def test_what_do_you_know_about_me_reads_profile(fake_vault):
@@ -124,4 +128,4 @@ async def test_forget_resets_profile(fake_vault):
     await state.process_command("remember that I like dark mode")
     ctx = await state.process_command("forget my profile")
     assert ctx["profile"]["action"] == "forgotten"
-    assert "dark mode" not in fake_vault.notes["People/me.md"]
+    assert "dark mode" not in fake_vault.notes["People/Me.md"]

@@ -1,12 +1,13 @@
 {
   "appId": "com.jarvis.desktop",
   "productName": "JARVIS",
+  "artifactName": "Jarvis-${version}.${ext}",
   "directories": {
     "output": "release"
   },
   "files": [
-    "electron/main.js",
-    "electron/preload.js",
+    "electron/**/*",
+    "node_modules/**/*",
     "package.json"
   ],
   "extraFiles": [
@@ -22,10 +23,14 @@
         "**/*",
         "!**/__pycache__/**",
         "!**/*.pyc",
+        "!**/*.log",
         "!.env",
+        "!**/.env.example",
+        "!**/pytest.ini",
         "!**/*.db",
         "!**/*.db-journal",
-        "!**/*.sqlite"
+        "!**/*.sqlite",
+        "!**/*.md"
       ]
     },
     {
@@ -44,20 +49,17 @@
       {
         "target": "AppImage",
         "arch": ["x64"]
+      },
+      {
+        "target": "deb",
+        "arch": ["x64"]
       }
     ],
     "category": "Utility",
-    "icon": "build/icons",
+    "icon": "build/icons/icon-512.png",
     "maintainer": "JARVIS Team <noreply@jarvis.app>",
     "synopsis": "Voice-first AI Assistant",
-    "desktop": {
-      "Name": "JARVIS",
-      "Comment": "Voice-first AI Assistant",
-      "StartupNotify": "true",
-      "Terminal": "false",
-      "Type": "Application",
-      "Categories": "Utility;Audio;Speech;"
-    }
+    "description": "JARVIS is a personal AI desktop companion with voice control, file management, and system integration."
   },
   "mac": {
     "category": "public.app-category.utilities",

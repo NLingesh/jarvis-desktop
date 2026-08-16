@@ -86,10 +86,31 @@ class NativeVoiceSession:
             "vad": self.vad.diagnostics(),
         }
 
+    def _start_consumer(self) -> None:
+        """Start the consumer thread unless one is already running.
+
+        Guards against duplicate consumer threads when the session is reused
+        (e.g. ``connect`` after a mic test, or a reconnect after the stream was
+        reopened underneath us).
+        """
+        if self._consumer_thread and self._consumer_thread.is_alive():
+            return
+        self._consumer_stop.clear()
+        self._consumer_thread = threading.Thread(
+            target=self._consumer_loop, name="voice-consumer", daemon=True
+        )
+        self._consumer_thread.start()
+
     # --------------------------------------------------------------- lifecycle
     def connect(self) -> bool:
         """Open the microphone stream and enter READY."""
         if self._state in (STATE_LISTENING, STATE_PROCESSING):
+            return True
+        if (
+            self._state == STATE_READY
+            and self._consumer_thread
+            and self._consumer_thread.is_alive()
+        ):
             return True
         self._set_state(STATE_CONNECTING, "opening microphone")
         ok = self.mic.start()
@@ -98,11 +119,7 @@ class NativeVoiceSession:
             self._set_state(STATE_ERROR, self._error)
             logger.error("voice: connect failed: %s", self._error)
             return False
-        self._consumer_stop.clear()
-        self._consumer_thread = threading.Thread(
-            target=self._consumer_loop, name="voice-consumer", daemon=True
-        )
-        self._consumer_thread.start()
+        self._start_consumer()
         self._set_state(STATE_READY, self.mic.device_info().get("name") or "")
         return True
 
@@ -130,8 +147,9 @@ class NativeVoiceSession:
         if mode not in VALID_MODES:
             self._set_state(STATE_ERROR, f"unknown mode {mode!r}")
             return False
+        if self._state == STATE_LISTENING:
+            return True
         if self._state != STATE_READY and not self.connect():
-            # Best-effort auto-connect so a click always works.
             return False
         self._mode = mode
         self._recording = True
@@ -214,10 +232,6 @@ class NativeVoiceSession:
             self._set_state(STATE_ERROR, self._error)
             return False
         self._report_levels = True
-        self._consumer_stop.clear()
-        self._consumer_thread = threading.Thread(
-            target=self._consumer_loop, name="voice-consumer", daemon=True
-        )
-        self._consumer_thread.start()
+        self._start_consumer()
         self._set_state(STATE_READY, "mic test")
         return True

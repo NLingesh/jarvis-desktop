@@ -4,7 +4,6 @@ Creating the module-level singletons here avoids each route file
 instantiating its own copy of MemoryManager, LLMProvider, etc.
 """
 
-import asyncio
 import contextlib
 import logging
 import os
@@ -36,10 +35,13 @@ from managers.voice_manager import VoiceManager
 from managers.workflow_manager import WorkflowManager
 from modules.auth import AuthService
 from modules.calendar_module import CalendarModule
+from modules.capability import CapabilityPolicy
 from modules.documents_module import DocumentsModule
 from modules.llm_provider import LLMProvider
 from modules.mail_module import MailModule, MailSessionStore
 from modules.notes_module import NotesModule
+from modules.orchestrator import Orchestrator, strip_markdown_for_speech
+from modules.session_context import SessionContextStore
 from modules.settings import (  # noqa: F401  (re-exported for routes.deps / tests)
     KEY_NAMES,
     _mask_secret,
@@ -58,13 +60,21 @@ from tools.app_tools import LaunchAppTool, OpenTerminalTool
 from tools.desktop_tools import CloseAppTool, ScreenshotTool
 from tools.document_tools import ReadDocumentTool
 from tools.file_tools import (
+    CopyFileTool,
+    CreateFileTool,
+    CreateFolderTool,
+    DeleteFileTool,
     FileSearchTool,
+    FindByExtensionTool,
+    FindRecentFilesTool,
+    IdentifyFileTypeTool,
     ListDirectoryTool,
+    MoveFileTool,
     OpenFileTool,
     OpenFolderTool,
     ReadFileTool,
 )
-from tools.memory_tools import RecallMemoryTool, RememberMemoryTool
+from tools.memory_tools import ForgetMemoryTool, RecallMemoryTool, RememberMemoryTool
 from tools.shell_tools import ExecuteShellTool
 from tools.system_tools import RunningProcessesTool, SystemInfoTool
 from tools.web_tools import WebSearchTool
@@ -134,6 +144,9 @@ ENV_FILE_PATH = (
 # --- Pending document confirmations -----------------------------------------
 pending_documents_actions: dict[str, Callable] = {}
 
+# --- Pending tool confirmations ---------------------------------------------
+pending_tool_confirmations: dict[str, dict] = {}
+
 # --- Security helpers (command allowlist, session-token checks) -------------
 # Single allowlist lives in modules.system_actions; re-exported here for
 # backward compatibility with routes.deps and openapi.py.
@@ -149,6 +162,49 @@ def require_session_token(request) -> None:
         from fastapi import HTTPException
 
         raise HTTPException(status_code=401, detail="Invalid or missing session token")
+
+
+# Origins the local dev tooling may use to fetch the dev session token.
+DEV_WEB_ORIGINS = {
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+}
+
+
+def _is_loopback_host(host: str) -> bool:
+    hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+    return hostname in ("localhost", "127.0.0.1", "::1", "")
+
+
+def session_token_available(request) -> bool:
+    """Whether the dev-only /api/session-token endpoint may serve the token.
+
+    Fails closed unless every condition holds:
+    * not packaged (no SESSION_TOKEN_PATH);
+    * the backend is bound to a loopback interface (SERVER_HOST);
+    * the caller's Host header is loopback;
+    * if an Origin header is present, it is a known local dev origin.
+    """
+    if SESSION_TOKEN_PATH:
+        return False
+    server_host = os.getenv("SERVER_HOST", "127.0.0.1").strip()
+    if not _is_loopback_host(server_host):
+        return False
+    if not _is_loopback_host(request.headers.get("host", "")):
+        return False
+    origin = request.headers.get("origin")
+    if origin and origin not in DEV_WEB_ORIGINS:
+        return False
+    return True
+
+
+def get_dev_session_token(request) -> dict | None:
+    """Return the dev session token, or None when not in the dev context."""
+    if not session_token_available(request):
+        return None
+    return {"token": SESSION_TOKEN}
 
 
 def validate_system_command(command: str) -> str:
@@ -255,6 +311,20 @@ tool_registry.register(WebSearchTool())
 tool_registry.register(ReadDocumentTool())
 tool_registry.register(RememberMemoryTool())
 tool_registry.register(RecallMemoryTool())
+tool_registry.register(ForgetMemoryTool())
+tool_registry.register(FindRecentFilesTool())
+tool_registry.register(FindByExtensionTool())
+tool_registry.register(IdentifyFileTypeTool())
+tool_registry.register(CreateFileTool())
+tool_registry.register(CreateFolderTool())
+tool_registry.register(MoveFileTool())
+tool_registry.register(CopyFileTool())
+tool_registry.register(DeleteFileTool())
+
+# --- Orchestration singletons ------------------------------------------------
+capability_policy = CapabilityPolicy()
+session_context_store = SessionContextStore()
+orchestrator = Orchestrator(llm, tool_registry, capability_policy)
 
 # --- Markdown vault ---------------------------------------------------------
 MEMORY_VAULT_PATH = os.getenv("MEMORY_VAULT_PATH") or os.path.join(
@@ -269,14 +339,33 @@ else:
 notes = NotesModule(vault=vault)
 
 # --- User profile note (vault-backed preferences) ---------------------------
-PROFILE_NOTE_PATH = "People/me.md"
+PROFILE_NOTE_PATH = "People/Me.md"
+_PROFILE_NOTE_LEGACY_PATHS = ("People/me.md", "people/me.md", "people/Me.md")
 _PROFILE_NOTE_BODY = "## About\n(Add things to remember about the user here.)"
+
+
+def resolve_profile_note_path() -> str:
+    """Return the profile note path, preferring whatever casing already exists.
+
+    ``create_note(title="Me")`` produces ``People/Me.md`` (slugify preserves
+    case). On case-insensitive filesystems all casings are the same file; on
+    Linux they are distinct, so existing installs may hold ``People/me.md``.
+    This resolves to the existing path (migration/fallback) or the canonical
+    ``People/Me.md`` when nothing exists yet.
+    """
+    for candidate in (PROFILE_NOTE_PATH, *_PROFILE_NOTE_LEGACY_PATHS):
+        try:
+            if vault.store.exists(candidate):
+                return candidate
+        except Exception:
+            continue
+    return PROFILE_NOTE_PATH
 
 
 async def get_profile_note() -> dict | None:
     """Return the user profile/preferences note, or None if it does not exist."""
     try:
-        return await vault.get_note(PROFILE_NOTE_PATH)
+        return await vault.get_note(resolve_profile_note_path())
     except FileNotFoundError:
         return None
     except Exception:
@@ -303,7 +392,7 @@ async def ensure_profile_note() -> dict | None:
 async def reset_profile_note() -> bool:
     """Clear the profile note back to its empty scaffold."""
     try:
-        await vault.update_note(PROFILE_NOTE_PATH, content=_PROFILE_NOTE_BODY)
+        await vault.update_note(resolve_profile_note_path(), content=_PROFILE_NOTE_BODY)
         return True
     except Exception:
         return False
@@ -518,6 +607,23 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
             context["documents"] = {"action": "cancelled", "message": "Action cancelled."}
             return context
 
+    if session_id and session_id in pending_tool_confirmations:
+        lower = user_input.lower()
+        if lower in ("yes", "yeah", "yep", "sure", "okay", "do it", "confirm", "proceed"):
+            pending = pending_tool_confirmations.pop(session_id)
+            tool_name = pending.get("tool")
+            tool_args = pending.get("args", {})
+            if tool_name:
+                tool_args["confirm"] = True
+                result = await tool_registry.execute_tool(tool_name, tool_args)
+                context.setdefault("tools", {})
+                context["tools"][tool_name] = result.to_dict()
+            return context
+        if lower in ("no", "nope", "cancel", "stop", "don't"):
+            pending_tool_confirmations.pop(session_id, None)
+            context["tools"] = {"action": "cancelled", "message": "Action cancelled."}
+            return context
+
     user_lower = user_input.lower()
 
     # --- Profile / preferences commands --------------------------------------
@@ -535,7 +641,7 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
             if line not in existing:
                 new_body = f"{existing}\n{line}" if existing.strip() else f"## About\n{line}"
                 with contextlib.suppress(Exception):
-                    await vault.update_note(PROFILE_NOTE_PATH, content=new_body)
+                    await vault.update_note(resolve_profile_note_path(), content=new_body)
         context["profile"] = {"action": "remembered", "fact": fact}
         return context
 
@@ -685,71 +791,326 @@ async def stream_speech_to_socket(websocket, text: str, voice_uid: str) -> None:
         await _stream_sentence_audio(websocket, sentence, voice_uid)
 
 
+_last_action_context: dict[str, dict] = {}
+
+
+def _get_last_context(session_id: str) -> dict | None:
+    return _last_action_context.get(session_id)
+
+
+def _set_last_context(session_id: str, context: dict) -> None:
+    _last_action_context[session_id] = context
+    if len(_last_action_context) > 200:
+        keys = list(_last_action_context.keys())
+        for k in keys[:100]:
+            _last_action_context.pop(k, None)
+
+
 async def _route_tools(user_input: str, session_id: str) -> dict | None:
     """Match natural-language input to tools and execute them when confident."""
-    lower = user_input.lower()
+    lower = user_input.lower().strip()
     tool_results: dict = {}
+    confirmations: dict = {}
 
     async def _maybe(tool_name: str, args: dict) -> None:
         result = await tool_registry.execute_tool(tool_name, args)
+        if result.requires_confirmation:
+            pending_tool_confirmations[session_id] = {
+                "tool": tool_name,
+                "args": args,
+                "prompt": result.confirmation_prompt,
+            }
         tool_results[tool_name] = result.to_dict()
+        if result.success:
+            _set_last_context(session_id, {
+                "tool": tool_name,
+                "args": args,
+                "result": result.to_dict(),
+                "timestamp": __import__("time").time(),
+            })
 
-    if any(k in lower for k in ["cpu", "memory", "disk", "uptime", "gpu", "processes", "system info", "status"]):
+    def _first_match(patterns: list[str], text: str) -> bool:
+        return any(p in text for p in patterns)
+
+    def _after_phrases(text: str, phrases: list[str]) -> str:
+        for p in phrases:
+            if p in text:
+                return text.split(p, 1)[-1].strip().strip(".\"'?!")
+        return text
+
+    # System information
+    if _first_match([
+        "cpu", "memory", "ram", "disk", "storage", "uptime",
+        "gpu", "processes", "system info", "system status",
+        "how much ram", "how much cpu", "how much memory",
+        "what's using the most ram", "what's using the most cpu",
+        "is my gpu", "what gpu", "laptop temperature", "temperature"
+    ], lower):
         await _maybe("system_info", {"query": lower})
-    elif "launch " in lower or "open " in lower:
-        app = lower.split("open ")[-1].split("launch ")[-1].strip()
-        await _maybe("launch_app", {"app": app})
-    elif "terminal" in lower and ("open" in lower or "launch" in lower):
-        await _maybe("open_terminal", {})
-    elif "close" in lower:
-        app = lower.replace("close", "").strip()
+    # Application control
+    elif _first_match([
+        "launch ", "open ", "start ", "run ", "firefox", "chrome",
+        "chromium", "vs code", "code ", "terminal", "nautilus",
+        "dolphin", "spotify", "vlc", "opera"
+    ], lower):
+        app = _after_phrases(lower, ["launch ", "open ", "start ", "run "])
+        app = app.strip(".\"'?!").strip()
+        if app in ["terminal", "the terminal"]:
+            await _maybe("open_terminal", {})
+        else:
+            await _maybe("launch_app", {"app": app})
+    elif _first_match(["close ", "kill "], lower) and not _first_match(["close all", "kill all"], lower):
+        app = _after_phrases(lower, ["close ", "kill "])
         await _maybe("close_app", {"app": app})
+    elif _first_match(["what applications", "what's running", "list apps", "running apps", "what processes"], lower):
+        await _maybe("running_processes", {"limit": 15})
+    elif _first_match([
+        "look at my screen",
+        "what is on my screen",
+        "what's on my screen",
+        "read my screen",
+        "read the screen",
+        "explain what i'm seeing",
+        "explain this screen",
+        "what do you see",
+        "what is this",
+        "look at my",
+        "see what i'm",
+        "analyze my screen",
+        "analyze the screen",
+        "what's on the screen",
+        "what is on the screen",
+        "look at the screen",
+        "read this",
+        "look at this",
+        "what is this image",
+        "what's in this image",
+        "describe my screen",
+        "describe the screen",
+        "what is happening on my screen",
+        "what's happening on my screen",
+        "what is displayed",
+        "what's displayed",
+        "check my screen",
+        "see my screen",
+        "view my screen",
+        "what's open on my screen",
+        "what is open on my screen",
+    ], lower):
+        await _maybe("screenshot", {"analyze": True, "prompt": "Describe what is on this screen in detail, including any errors, text, windows, or important visual elements."})
     elif "screenshot" in lower:
         await _maybe("screenshot", {})
-    elif any(k in lower for k in ["find file", "search file", "locate file"]):
-        query = re.sub(r"(find|search|locate)\s+(file|files)\s*(named|called)?\s*", "", lower).strip()
-        await _maybe("file_search", {"query": query, "directory": str(Path.home())})
-    elif "list files" in lower or "list directory" in lower or "what files" in lower:
-        await _maybe("list_directory", {"path": str(Path.home())})
-    elif "read file" in lower or "open file" in lower:
-        path = re.sub(r"(read|open)\s+(the\s+)?file\s+", "", lower).strip().strip("\"'")
-        await _maybe("read_file", {"path": path})
-    elif "open folder" in lower or "open downloads" in lower or "open documents" in lower:
+    # File operations
+    elif _first_match(["find file", "search file", "locate file", "find my ", "search for file", "where is my", "locate my", "find the ", "search the ", "find all "], lower):
+        query = _after_phrases(lower, [
+            "find file", "search file", "locate file", "find my ", "search for file",
+            "where is my", "locate my", "find the ", "search the ", "find all "
+        ])
+        query = query.strip(".\"'?!").strip()
+        if query:
+            await _maybe("file_search", {"query": query, "directory": str(Path.home())})
+    elif _first_match(["list files", "list directory", "show files", "show directory", "what files", "what's inside", "what is inside", "contents of", "show me the files", "show inside", "list inside"], lower):
+        path = str(Path.home())
+        for keyword in ["downloads", "documents", "desktop", "pictures", "home", "project"]:
+            if keyword in lower:
+                path = os.path.expanduser(f"~/{keyword.capitalize()}")
+                if keyword == "project":
+                    path = os.path.expanduser("~/Desktop/Project Folder")
+                break
+        await _maybe("list_directory", {"path": path})
+    elif _first_match(["read file", "open file", "read ", "show me ", "open the ", "open ", "read the "], lower) and not _first_match([
+        "open folder", "open downloads", "open documents", "open desktop", "open home", "open project"
+    ], lower):
+        path = _after_phrases(lower, [
+            "read file", "open file", "read the ", "read ", "show me ", "open the ", "open "
+        ])
+        path = path.strip(".\"'?!").strip()
+        if path:
+            await _maybe("read_file", {"path": path})
+    elif _first_match(["open folder", "open downloads", "open documents", "open desktop", "open home", "open project"], lower):
         path_map = {
             "downloads": os.path.expanduser("~/Downloads"),
             "documents": os.path.expanduser("~/Documents"),
             "home": os.path.expanduser("~"),
             "desktop": os.path.expanduser("~/Desktop"),
             "pictures": os.path.expanduser("~/Pictures"),
+            "project": os.path.expanduser("~/Desktop/Project Folder"),
         }
         for key, val in path_map.items():
             if key in lower:
                 await _maybe("open_folder", {"path": val})
                 break
-    elif "run " in lower or "execute " in lower:
-        cmd = re.sub(r"^(run|execute)\s+", "", lower).strip()
-        await _maybe("execute_shell", {"command": cmd})
-    elif "web search" in lower or "search web" in lower or "look up" in lower:
-        query = re.sub(r"(web\s+search|search\s+web|look\s+up)\s+(for\s+)?", "", lower).strip()
-        await _maybe("web_search", {"query": query})
-    elif "read document" in lower or "summarize" in lower or "summarise" in lower:
-        path = re.sub(r"(read|summarize|summarise)\s+(document|file|pdf)?\s*", "", lower).strip().strip("\"'")
-        await _maybe("read_document", {"path": path})
-    elif "remember " in lower:
-        fact = re.sub(r"^remember\s+(that\s+)?", "", lower).strip().strip(".")
-        await _maybe("remember_memory", {"fact": fact})
-    elif "what do you remember" in lower or "recall" in lower:
+    elif _first_match(["find recent", "recent files", "modified today", "recently modified"], lower):
+        await _maybe("find_recent_files", {"directory": str(Path.home()), "hours": 24, "limit": 20})
+    elif _first_match(["find all ", "all python files", "all pdf", "all images", "all jpg", "all png"], lower):
+        ext = _after_phrases(lower, ["find all ", "all "])
+        ext = ext.split()[0] if ext.split() else "py"
+        await _maybe("find_by_extension", {"extension": ext, "directory": str(Path.home()), "limit": 30})
+    elif _first_match(["create folder", "create directory", "make folder", "new folder", "make directory"], lower):
+        path = _after_phrases(lower, ["create folder", "create directory", "make folder", "new folder", "make directory"])
+        path = path.strip(".\"'?!").strip()
+        if path:
+            await _maybe("create_folder", {"path": path})
+    elif _first_match(["create file", "new file", "make file"], lower):
+        path = _after_phrases(lower, ["create file", "new file", "make file"])
+        path = path.strip(".\"'?!").strip()
+        if path:
+            await _maybe("create_file", {"path": path})
+    elif _first_match(["delete file", "delete ", "remove file", "remove ", "trash "], lower) and not _first_match(["delete folder", "delete directory", "delete all"], lower):
+        path = _after_phrases(lower, ["delete file", "delete ", "remove file", "remove ", "trash "])
+        path = path.strip(".\"'?!").strip()
+        if path:
+            await _maybe("delete_file", {"path": path})
+    elif _first_match(["delete folder", "delete directory", "remove folder", "remove directory"], lower):
+        path = _after_phrases(lower, ["delete folder", "delete directory", "remove folder", "remove directory"])
+        path = path.strip(".\"'?!").strip()
+        if path:
+            await _maybe("delete_file", {"path": path})
+    elif "web search" in lower or "search web" in lower or "look up" in lower or "search the internet" in lower or "search for" in lower:
+        query = _after_phrases(lower, [
+            "web search", "search web", "look up", "search the internet", "search for"
+        ])
+        query = query.strip(".\"'?!").strip()
+        if query:
+            await _maybe("web_search", {"query": query})
+    elif "remember " in lower and "what do you remember" not in lower and "recall" not in lower and "forget" not in lower:
+        fact = _after_phrases(lower, ["remember ", "remember that "])
+        fact = fact.strip(".\"'?!").strip()
+        if fact:
+            await _maybe("remember_memory", {"fact": fact})
+    elif "forget " in lower or "forget that " in lower:
+        query = _after_phrases(lower, ["forget ", "forget that "])
+        query = query.strip(".\"'?!").strip()
+        if query:
+            await _maybe("forget_memory", {"query": query})
+    elif "what do you remember" in lower or "recall" in lower or "what is my" in lower or "do you remember" in lower:
         await _maybe("recall_memory", {"query": lower})
+    else:
+        last = _get_last_context(session_id)
+        if last:
+            last_tool = last.get("tool")
+            if last_tool == "open_folder" and _first_match([
+                "what's inside", "what is inside", "show inside",
+                "list inside", "contents", "what files"
+            ], lower):
+                await _maybe("list_directory", {"path": last["args"].get("path", str(Path.home()))})
+            elif last_tool in ("read_file", "read_document") and _first_match([
+                "explain", "what is this", "summarize", "summarise", "what does this do"
+            ], lower):
+                content = last.get("result", {}).get("data", {}).get("content") or ""
+                if content:
+                    tool_results["explain_context"] = {
+                        "path": last["args"].get("path"),
+                        "content": content[:4000],
+                        "instruction": "explain" if "explain" in lower else "summarize",
+                    }
 
+    if confirmations:
+        return {"tool_results": tool_results, "confirmations": confirmations}
     if tool_results:
         return {"tool_results": tool_results}
     return None
 
 
+def _plain_reply_from_tool_results(tool_results: dict) -> str:
+    """Offline fallback: build a concise, honest reply from verified tool results."""
+    parts = []
+    for tool, result in tool_results.items():
+        if tool in ("available",) or not isinstance(result, dict):
+            continue
+        data = result.get("data") or {}
+        if result.get("success"):
+            if tool == "launch_app":
+                parts.append(f"Opened {data.get('launched')}.")
+            elif tool == "open_file":
+                parts.append(f"Opened {data.get('opened')}.")
+            elif tool == "open_folder":
+                parts.append(f"Opened {data.get('opened')}.")
+            elif tool == "close_app":
+                parts.append(f"Closed {len(data.get('killed') or [])} running process(es).")
+            elif tool == "create_file":
+                parts.append(f"Created {data.get('created')}.")
+            elif tool == "create_folder":
+                parts.append(f"Created {data.get('created')}.")
+            elif tool == "delete_file":
+                parts.append(f"Deleted {data.get('deleted')}.")
+            elif tool == "move_file":
+                parts.append(f"Moved {data.get('moved')} to {data.get('to')}.")
+            elif tool == "copy_file":
+                parts.append(f"Copied {data.get('copied')} to {data.get('to')}.")
+            elif tool == "remember_memory":
+                parts.append("Remembered.")
+            elif tool == "forget_memory":
+                parts.append(f"Forgot {data.get('removed')} item(s).")
+            elif tool == "recall_memory":
+                facts = data.get("facts") or []
+                parts.append("Here's what I remember: " + "; ".join(facts[:5]))
+            elif tool == "find_recent_files":
+                files = data.get("files") or []
+                parts.append(f"Found {len(files)} recently modified file(s).")
+            elif tool == "find_by_extension":
+                files = data.get("files") or []
+                parts.append(f"Found {len(files)} matching file(s).")
+            elif tool == "file_search":
+                parts.append(f"Found {data.get('count', 0)} matching file(s).")
+            elif tool == "list_directory":
+                parts.append(f"Listed {data.get('count', 0)} item(s).")
+            elif tool == "read_file":
+                content = (data.get("content") or "").strip()
+                parts.append((content[:400] or "That file is empty."))
+            elif tool == "system_info" or tool == "running_processes":
+                parts.append("Here's the current system information.")
+            elif tool == "screenshot":
+                parts.append("Screenshot captured.")
+            else:
+                parts.append(f"{tool.replace('_', ' ').capitalize()} completed.")
+        else:
+            parts.append(f"I couldn't complete that: {result.get('error')}")
+    return " ".join(parts) if parts else "I couldn't complete that."
+
+
+async def handle_ws_confirm(
+    session_id: str, tool_name: str, confirm: bool, websocket, voice_uid: str = ""
+) -> None:
+    """Handle a single-use confirmation for an orchestrator-requested tool."""
+    session_ctx = session_context_store.get(session_id)
+    if session_ctx.pending_tool != tool_name:
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "response", "text": "No pending action to confirm."}
+            )
+        return
+    if not confirm:
+        session_ctx.pending_tool = None
+        session_ctx.pending_args = None
+        capability_policy.revoke_session(session_id)
+        with contextlib.suppress(Exception):
+            await websocket.send_json({"type": "response", "text": "Action cancelled."})
+        return
+    context: dict = {"tools": {}}
+    profile = await get_profile_note()
+    if profile and profile.get("body"):
+        context["profile"] = profile["body"]
+    reply = await orchestrator.respond_to_confirmed(session_id, session_ctx, context)
+    full_text = strip_markdown_for_speech(reply or "")
+    if not full_text.strip():
+        full_text = "Done."
+    logger.info("[voice:%s] Confirmed action reply: %s", voice_uid, full_text)
+    await memory_manager.add_message(session_id, "assistant", full_text)
+    sentences = [
+        s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()
+    ] or [full_text]
+    await websocket.send_json({"type": "status", "status": "generating_speech"})
+    await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
+    for sentence in sentences:
+        await _stream_sentence_audio(websocket, sentence, voice_uid)
+    await websocket.send_json({"type": "response", "text": full_text, "audio": None})
+
+
 async def handle_user_input(
     user_input: str, session_id: str, websocket, voice_uid: str = ""
 ) -> None:
-    """Process a single user utterance: gather context, stream LLM reply and TTS."""
+    """Process a single user utterance via the typed orchestrator, then TTS."""
     from starlette.websockets import WebSocketDisconnect  # noqa: F401
 
     await memory_manager.add_message(session_id, "user", user_input)
@@ -763,81 +1124,108 @@ async def handle_user_input(
         terminal_sent = True
 
     try:
+        # --- voice/text confirmation of a pending orchestrator approval ---------
+        session_ctx = session_context_store.get(session_id)
+        pending_tool = session_ctx.pending_tool
+        if pending_tool and capability_policy.has_pending(session_id, pending_tool):
+            lowered = user_input.strip().lower().rstrip(".!?")
+            if lowered in (
+                "yes", "yeah", "yep", "sure", "okay", "ok", "do it", "confirm",
+                "proceed", "go ahead", "please", "yes please", "go",
+            ):
+                await handle_ws_confirm(session_id, pending_tool, True, websocket, voice_uid)
+                return
+            if lowered in ("no", "nope", "cancel", "stop", "don't", "no don't", "don't do it"):
+                await handle_ws_confirm(session_id, pending_tool, False, websocket, voice_uid)
+                return
+
         context = await process_command(user_input, session_id=session_id)
 
-        tool_result = await _route_tools(user_input, session_id)
-        if tool_result:
-            context.setdefault("tools", {})
-            context["tools"].update(tool_result)
+        decision = await orchestrator.run(user_input, session_id, session_ctx, context)
 
-        context_manager_result = await context_manager.build_context(
-            session_id=session_id, query=user_input
-        )
-        context.setdefault("intelligence", context_manager_result)
+        if decision.kind == "confirm":
+            await websocket.send_json(
+                {
+                    "type": "confirmations",
+                    "confirmations": {
+                        decision.tool: {
+                            "tool": decision.tool,
+                            "args": decision.arguments or {},
+                            "confirmation_prompt": decision.reason or "Please confirm this action.",
+                        }
+                    },
+                    "message": decision.reason or "Please confirm this action.",
+                }
+            )
+            return
 
-        profile = await get_profile_note()
-        if profile and profile.get("body"):
-            context["profile"] = profile["body"]
-
-        conversation = await memory_manager.get_conversation(session_id)
-
-        memory_results = []
-        with contextlib.suppress(Exception):
-            memory_results = await memory_manager.search_memory(user_input, session_id=session_id)
-
-        buffer = ""
-        full_text = ""
-        sentences: list[str] = []
-        llm_failed = False
-
-        try:
-            async for chunk in llm.get_response_stream(
-                user_message=user_input,
-                conversation_history=conversation,
-                context=context,
-                memory_results=memory_results,
-            ):
-                buffer += chunk
-                full_text += chunk
-
-                while True:
-                    match = re.search(r"[.!?]\s+", buffer)
-                    if not match:
-                        break
-                    sentence = buffer[: match.end()].strip()
-                    buffer = buffer[match.end() :]
-                    sentences.append(sentence)
-
-                    await websocket.send_json({"type": "partial", "text": full_text.strip()})
-                    await asyncio.sleep(0.01)
-        except Exception as e:
-            llm_failed = True
-            logger.error("[voice:%s] LLM streaming failed: %s", voice_uid, e)
-
-        if buffer.strip():
-            sentences.append(buffer.strip())
-            await websocket.send_json({"type": "partial", "text": full_text.strip()})
-
-        if not full_text.strip():
-            if not llm_failed:
-                full_text = "I couldn't generate a response. Please try again."
-            else:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": "The AI backend is not responding. Check your API keys in .env and try again.",
-                    }
+        if decision.kind == "error":
+            # Offline resilience: fall back to the legacy keyword router.
+            fallback = await _route_tools(user_input, session_id)
+            if fallback:
+                context.setdefault("tools", {})
+                context["tools"].update(fallback)
+                pending = pending_tool_confirmations.get(session_id)
+                if pending:
+                    await websocket.send_json(
+                        {
+                            "type": "confirmations",
+                            "confirmations": {
+                                pending.get("tool", "action"): {
+                                    "tool": pending.get("tool"),
+                                    "args": pending.get("args", {}),
+                                    "confirmation_prompt": pending.get(
+                                        "prompt", "Please confirm this action."
+                                    ),
+                                }
+                            },
+                            "message": pending.get(
+                                "prompt", "Please confirm this action."
+                            ),
+                        }
+                    )
+                    return
+                full_text = strip_markdown_for_speech(
+                    _plain_reply_from_tool_results(fallback)
                 )
-                mark_terminal()
-                return
+                if full_text:
+                    logger.info("[voice:%s] Fallback reply: %s", voice_uid, full_text[:200])
+                    await memory_manager.add_message(session_id, "assistant", full_text)
+                    await websocket.send_json({"type": "status", "status": "generating_speech"})
+                    sentences = [
+                        s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()
+                    ] or [full_text]
+                    await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
+                    for sentence in sentences:
+                        await _stream_sentence_audio(websocket, sentence, voice_uid)
+                    await websocket.send_json({"type": "response", "text": full_text, "audio": None})
+                    mark_terminal()
+                    return
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "The AI backend is not responding. Check your API keys in .env and try again.",
+                }
+            )
+            return
+
+        # --- natural reply (decision.kind in {"reply", "clarify"}) --------------
+        full_text = strip_markdown_for_speech(decision.text or "")
+        if not full_text.strip():
+            full_text = "I couldn't generate a response. Please try again."
 
         logger.info("[voice:%s] LLM: %s", voice_uid, full_text.strip())
         await memory_manager.add_message(session_id, "assistant", full_text.strip())
 
+        sentences = [
+            s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()
+        ]
+        if not sentences:
+            sentences = [full_text]
+
         if sentences:
             await websocket.send_json({"type": "status", "status": "generating_speech"})
             await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
-
             for sentence in sentences:
                 await _stream_sentence_audio(websocket, sentence, voice_uid)
 

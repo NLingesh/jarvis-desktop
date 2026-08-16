@@ -209,8 +209,11 @@ class TTSManager:
                     extra={"provider": name, "status": "failed", "error": str(e)},
                 )
 
+        got_edge = False
         async for chunk in self._edge_tts_stream(text):
-            yield chunk
+            got_edge = True
+            yield self._to_base64(chunk)
+        if got_edge:
             return
 
         b64 = await self._system_tts(text)

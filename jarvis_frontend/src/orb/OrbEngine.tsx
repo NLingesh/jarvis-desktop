@@ -10,6 +10,7 @@ export type OrbState =
   | 'notification'
   | 'offline'
   | 'error'
+  | 'working'
   | 'panel-open';
 
 export interface OrbEngineProps {
@@ -19,7 +20,7 @@ export interface OrbEngineProps {
   onClick?: () => void;
   onExpandPanel?: () => void;
   onSingleClick?: () => void;
-  onQuickAction?: (action: 'talk' | 'chat' | 'memory' | 'tools') => void;
+  onQuickAction?: (action: 'talk' | 'chat' | 'settings') => void;
   onDragMove?: (dx: number, dy: number) => void;
   onDragEnd?: () => void;
   onContextMenu?: () => void;
@@ -44,15 +45,31 @@ const STATE_COLORS: Record<OrbState, { core: string; glow: string; particle: str
   notification: { core: '#00ff88', glow: 'rgba(0,255,136,0.5)', particle: '#00ff88' },
   offline: { core: '#555566', glow: 'rgba(85,85,102,0.2)', particle: '#555566' },
   error: { core: '#ff4466', glow: 'rgba(255,68,102,0.4)', particle: '#ff4466' },
+  working: { core: '#ffb020', glow: 'rgba(255,176,32,0.35)', particle: '#ffb020' },
   'panel-open': { core: '#00ff88', glow: 'rgba(0,255,136,0.2)', particle: '#00ff88' },
 };
 
 const QUICK_ACTIONS = [
   { id: 'talk' as const, label: 'Talk', icon: '\uD83C\uDF99\uFE0F', angle: 0 },
   { id: 'chat' as const, label: 'Chat', icon: '\uD83D\uDCAC', angle: 90 },
-  { id: 'memory' as const, label: 'Memory', icon: '\uD83E\uDDE0', angle: 180 },
-  { id: 'tools' as const, label: 'Tools', icon: '\uD83D\uDD27', angle: 270 },
+  { id: 'settings' as const, label: 'Settings', icon: '\u2699\uFE0F', angle: 180 },
 ];
+
+function hexToRgb(hex: string): [number, number, number] {
+  const m = hex.replace('#', '').match(/.{1,2}/g);
+  if (!m || m.length < 3) return [0, 0, 0];
+  return [parseInt(m[0], 16), parseInt(m[1], 16), parseInt(m[2], 16)];
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  return '#' + [r, g, b].map((x) => Math.round(x).toString(16).padStart(2, '0')).join('');
+}
+
+function lerpColor(a: string, b: string, t: number) {
+  const [ar, ag, ab] = hexToRgb(a);
+  const [br, bg, bb] = hexToRgb(b);
+  return rgbToHex(ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t);
+}
 
 const OrbEngine: React.FC<OrbEngineProps> = ({
   state,
@@ -97,6 +114,9 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
   const reducedMotion = prefersReducedMotion();
   const stateRef = useRef(state);
   stateRef.current = state;
+  const isDraggingRef = useRef(false);
+  const prevStateRef = useRef<OrbState>(state);
+  const transitionRef = useRef(0);
 
   const isPanelOpen = state === 'panel-open';
   const isNotification = state === 'notification';
@@ -220,7 +240,22 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
     ctx.clearRect(0, 0, w, h);
 
     const currentState = stateRef.current;
-    const c = STATE_COLORS[currentState];
+    if (prevStateRef.current !== currentState) {
+      transitionRef.current = now;
+      prevStateRef.current = currentState;
+    }
+    const transitionAge = now - transitionRef.current;
+    const transitionDuration = reducedMotion ? 0 : 320;
+    const t = transitionDuration > 0 ? Math.min(transitionAge / transitionDuration, 1) : 1;
+    const ease = t < 1 ? 0.5 - 0.5 * Math.cos(t * Math.PI) : 1;
+
+    const from = STATE_COLORS[prevStateRef.current] || STATE_COLORS['idle'];
+    const to = STATE_COLORS[currentState] || STATE_COLORS['idle'];
+    const c = {
+      core: lerpColor(from.core, to.core, ease),
+      glow: lerpColor(from.glow, to.glow, ease),
+      particle: lerpColor(from.particle, to.particle, ease),
+    };
 
     const isThinking = currentState === 'thinking';
     const isListening = currentState === 'listening';
@@ -228,6 +263,7 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
     const isError = currentState === 'error';
     const isProcessing = currentState === 'processing';
     const isOffline = currentState === 'offline';
+    const isWorking = currentState === 'working';
 
     const breathe = reducedMotion
       ? 1
@@ -394,6 +430,21 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
       ctx.stroke();
     }
 
+    if (isWorking) {
+      const t = now * 0.001;
+      const arcCount = 3;
+      for (let i = 0; i < arcCount; i++) {
+        const startAngle = t * 2.5 + (i * Math.PI * 2) / arcCount;
+        const arcRadius = radius * 1.12;
+        ctx.beginPath();
+        ctx.arc(orbX, orbY, arcRadius, startAngle, startAngle + Math.PI * 0.7);
+        ctx.strokeStyle = `rgba(255,176,32,${0.25 + Math.sin(t * 3 + i) * 0.15})`;
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      }
+    }
+
     if (isNotification) {
       const pulseScale = 1.1 + Math.sin(now * 0.004) * 0.05;
       const notifRadius = radius * pulseScale;
@@ -424,27 +475,27 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      if (isDragging) return;
+      if (isDraggingRef.current) return;
       if (isPanelOpen) {
         onClick?.();
         return;
       }
       onSingleClick?.();
     },
-    [isDragging, isPanelOpen, onClick, onSingleClick],
+    [isPanelOpen, onClick, onSingleClick],
   );
 
   const handleDoubleClick = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      if (isDragging) return;
+      if (isDraggingRef.current) return;
       onExpandPanel?.();
     },
-    [isDragging, onExpandPanel],
+    [isDraggingRef, onExpandPanel],
   );
 
   const handleQuickAction = useCallback(
-    (action: 'talk' | 'chat' | 'memory' | 'tools') => {
+    (action: 'talk' | 'chat' | 'settings') => {
       onQuickAction?.(action);
     },
     [onQuickAction],
@@ -462,6 +513,7 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
         const dy = moveEvent.clientY - startY;
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
           moved = true;
+          isDraggingRef.current = true;
           setIsDragging(true);
           setDragScale(1.15);
         }
@@ -472,6 +524,7 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
         if (moved) onDragEnd?.();
+        isDraggingRef.current = false;
         setIsDragging(false);
         setTimeout(
           () => {
@@ -514,6 +567,7 @@ const OrbEngine: React.FC<OrbEngineProps> = ({
       notification: 'New notification',
       offline: 'Offline',
       error: 'Connection error',
+      working: 'Working...',
       'panel-open': 'Panel open',
     };
     return labels[state] || 'JARVIS';

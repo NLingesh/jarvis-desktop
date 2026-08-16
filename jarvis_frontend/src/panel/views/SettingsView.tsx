@@ -15,6 +15,12 @@ export interface SettingsState {
   nativeMicDevice?: number | string;
 }
 
+export interface MicDevice {
+  id: number;
+  name: string;
+  is_default: boolean;
+}
+
 export interface EmailConfig {
   email: string;
   appPassword: string;
@@ -33,7 +39,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   speed: 1.0,
   theme: 'dark',
   enableNotifications: true,
-  serverUrl: 'localhost:8000',
+  serverUrl: '127.0.0.1:8000',
   enableWakeWord: true,
   alwaysOnListening: false,
   voiceMode: 'native',
@@ -53,11 +59,98 @@ const SettingsView: React.FC<SettingsViewProps> = ({
   const [settings, setSettings] = useState<SettingsState>(initialSettings || DEFAULT_SETTINGS);
   const [emailConfig, setEmailConfig] = useState<EmailConfig>(initialEmailConfig || DEFAULT_EMAIL);
   const [toast, setToast] = useState<string | null>(null);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [startMinimizedEnabled, setStartMinimizedEnabled] = useState(false);
+  const [micDevices, setMicDevices] = useState<MicDevice[]>([]);
+  const [micDevicesError, setMicDevicesError] = useState<string | null>(null);
+  const [micDevicesLoading, setMicDevicesLoading] = useState(false);
 
   useEffect(() => {
     if (initialSettings) setSettings(initialSettings);
     if (initialEmailConfig) setEmailConfig(initialEmailConfig);
   }, [initialSettings, initialEmailConfig]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const api = (window as any).electronAPI;
+        if (api?.getAutostartEnabled) {
+          setAutostartEnabled(await api.getAutostartEnabled());
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        const api = (window as any).electronAPI;
+        if (api?.getStartMinimized) {
+          setStartMinimizedEnabled(await api.getStartMinimized());
+        }
+      } catch {
+        // ignore
+      }
+    })();
+  }, []);
+
+  const loadMicDevices = useCallback(async () => {
+    if (settings.voiceMode !== 'native') return;
+    setMicDevicesLoading(true);
+    setMicDevicesError(null);
+    try {
+      const base = settings.serverUrl
+        .replace(/^ws:\/\//, 'http://')
+        .replace(/^wss:\/\//, 'https://')
+        .replace(/\/+$/, '');
+      const token = await getSessionToken();
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(`${base}/api/voice/devices`, { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      const list: MicDevice[] = (body.devices ?? []).map((d: any) => ({
+        id: d.id,
+        name: d.name,
+        is_default: Boolean(d.is_default),
+      }));
+      setMicDevices(list);
+      if (list.length === 0) {
+        setMicDevicesError('No microphone detected.');
+      }
+    } catch (err) {
+      setMicDevicesError(err instanceof Error ? err.message : 'Could not load microphones');
+    } finally {
+      setMicDevicesLoading(false);
+    }
+  }, [settings.serverUrl, settings.voiceMode]);
+
+  useEffect(() => {
+    loadMicDevices();
+  }, [loadMicDevices]);
+
+  const getSessionToken = useCallback(async (): Promise<string | null> => {
+    try {
+      const api = (window as any).electronAPI;
+      if (api?.getSessionToken) {
+        const token = (await api.getSessionToken()) as string | null;
+        if (token) return token;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      return localStorage.getItem('jarvisSessionToken');
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const activeMicLabel = useCallback(() => {
+    const selected = settings.nativeMicDevice;
+    if (selected !== undefined && micDevices.some((d) => d.id === selected)) {
+      return micDevices.find((d) => d.id === selected)?.name ?? 'Auto';
+    }
+    const def = micDevices.find((d) => d.is_default);
+    return def ? `${def.name} (default)` : 'Auto (default)';
+  }, [settings.nativeMicDevice, micDevices]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -81,6 +174,14 @@ const SettingsView: React.FC<SettingsViewProps> = ({
       });
     },
     [emailConfig, onSave, showToast],
+  );
+
+  const handleMicDeviceChange = useCallback(
+    (value: string) => {
+      const id = value === '' ? undefined : Number(value);
+      updateSetting('nativeMicDevice', id);
+    },
+    [updateSetting],
   );
 
   const updateEmail = useCallback(
@@ -186,10 +287,47 @@ const SettingsView: React.FC<SettingsViewProps> = ({
           </small>
         </div>
         {settings.voiceMode === 'native' && (
-          <div className="setting-item">
-            <label>Microphone test</label>
-            <MicTest serverUrl={settings.serverUrl} />
-          </div>
+          <>
+            <div className="setting-item">
+              <label htmlFor="s-micdevice">Microphone</label>
+              <select
+                id="s-micdevice"
+                value={
+                  settings.nativeMicDevice !== undefined &&
+                  micDevices.some((d) => d.id === settings.nativeMicDevice)
+                    ? String(settings.nativeMicDevice)
+                    : ''
+                }
+                onChange={(e) => handleMicDeviceChange(e.target.value)}
+                disabled={micDevicesLoading || micDevices.length === 0}
+              >
+                <option value="">
+                  {micDevicesLoading
+                    ? 'Loading microphones...'
+                    : micDevicesError
+                      ? micDevicesError
+                      : activeMicLabel()}
+                </option>
+                {micDevices.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}
+                    {d.is_default ? ' (default)' : ''}
+                  </option>
+                ))}
+              </select>
+              <small className="setting-hint">
+                {micDevicesError && micDevices.length === 0
+                  ? micDevicesError
+                  : settings.nativeMicDevice !== undefined
+                    ? 'Using selected microphone. Fallback to default if it disappears.'
+                    : 'Using the system default microphone.'}
+              </small>
+            </div>
+            <div className="setting-item">
+              <label>Microphone test</label>
+              <MicTest serverUrl={settings.serverUrl} />
+            </div>
+          </>
         )}
       </div>
 
@@ -267,11 +405,39 @@ const SettingsView: React.FC<SettingsViewProps> = ({
       <div className="settings-group">
         <h3 className="settings-group-title">Startup</h3>
         <div className="setting-item checkbox">
-          <input id="s-startup" type="checkbox" defaultChecked />
+          <input
+            id="s-startup"
+            type="checkbox"
+            checked={autostartEnabled}
+            onChange={async (e) => {
+              const val = e.target.checked;
+              setAutostartEnabled(val);
+              try {
+                const api = (window as any).electronAPI;
+                await api?.setAutostartEnabled(val);
+              } catch {
+                // ignore
+              }
+            }}
+          />
           <label htmlFor="s-startup">Launch JARVIS on startup</label>
         </div>
         <div className="setting-item checkbox">
-          <input id="s-minimize" type="checkbox" />
+          <input
+            id="s-minimize"
+            type="checkbox"
+            checked={startMinimizedEnabled}
+            onChange={async (e) => {
+              const val = e.target.checked;
+              setStartMinimizedEnabled(val);
+              try {
+                const api = (window as any).electronAPI;
+                await api?.setStartMinimized(val);
+              } catch {
+                // ignore
+              }
+            }}
+          />
           <label htmlFor="s-minimize">Start minimized to tray</label>
         </div>
       </div>

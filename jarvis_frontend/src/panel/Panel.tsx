@@ -1,41 +1,11 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import './Panel.css';
-import {
-  ChatView,
-  MemoryView,
-  FilesView,
-  ModelsView,
-  PluginsView,
-  SettingsView,
-  ToolsView,
-  TasksView,
-  AutomationView,
-  AdaptiveView,
-  ProactiveView,
-  SecurityView,
-  PerformanceView,
-  ProjectsView,
-  CodeView,
-} from './views';
+import { ChatView, SettingsView } from './views';
 import { usePanelChoreography } from './usePanelChoreography';
 import LoadingSpinner from '../components/LoadingSpinner';
+import type { SettingsState } from './views/SettingsView';
 
-export type PanelView =
-  | 'chat'
-  | 'memory'
-  | 'files'
-  | 'models'
-  | 'plugins'
-  | 'settings'
-  | 'tools'
-  | 'tasks'
-  | 'automation'
-  | 'adaptive'
-  | 'proactive'
-  | 'security'
-  | 'performance'
-  | 'projects'
-  | 'code';
+export type PanelView = 'chat' | 'settings';
 
 export interface PanelProps {
   open: boolean;
@@ -44,37 +14,23 @@ export interface PanelProps {
   onClose: () => void;
   orbPosition: { x: number; y: number };
   onToggleTalk?: () => void;
+  settings?: SettingsState;
+  onSaveSettings?: (settings: SettingsState) => void;
   className?: string;
   fillWindow?: boolean;
 }
-
-const VIEWS: { id: PanelView; label: string }[] = [
-  { id: 'chat', label: 'Chat' },
-  { id: 'memory', label: 'Memory' },
-  { id: 'files', label: 'Files' },
-  { id: 'models', label: 'Models' },
-  { id: 'plugins', label: 'Plugins' },
-  { id: 'settings', label: 'Settings' },
-  { id: 'tools', label: 'Tools' },
-  { id: 'tasks', label: 'Tasks' },
-  { id: 'automation', label: 'Automation' },
-  { id: 'adaptive', label: 'Adaptive' },
-  { id: 'proactive', label: 'Proactive' },
-  { id: 'security', label: 'Security' },
-  { id: 'performance', label: 'Performance' },
-  { id: 'projects', label: 'Projects' },
-  { id: 'code', label: 'Code' },
-];
 
 const STORAGE_KEY = 'jarvis-panel-position';
 
 const Panel: React.FC<PanelProps> = ({
   open,
-  view,
-  onViewChange,
+  view: _view,
+  onViewChange: _onViewChange,
   onClose,
   orbPosition,
   onToggleTalk,
+  settings,
+  onSaveSettings,
   className,
   fillWindow = false,
 }) => {
@@ -82,7 +38,9 @@ const Panel: React.FC<PanelProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragPosition, setDragPosition] = useState<{ x: number; y: number } | null>(null);
-  const [savedPanelPosition, setSavedPanelPosition] = useState<{ x: number; y: number } | null>(null);
+  const [savedPanelPosition, setSavedPanelPosition] = useState<{ x: number; y: number } | null>(
+    null,
+  );
   const [graceTimer, setGraceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -177,7 +135,7 @@ const Panel: React.FC<PanelProps> = ({
     setIsTransitioning(true);
     const timer = setTimeout(() => setIsTransitioning(false), 180);
     return () => clearTimeout(timer);
-  }, [view]);
+  }, [_view]);
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -233,11 +191,7 @@ const Panel: React.FC<PanelProps> = ({
             <div className="panel-mini-orb" aria-hidden="true">
               <span className="mini-orb-inner" />
             </div>
-            <select className="panel-model-picker" aria-label="Select model" defaultValue="jarvis">
-              <option value="jarvis">JARVIS</option>
-              <option value="llama">Llama 3</option>
-              <option value="mistral">Mistral</option>
-            </select>
+            <span className="panel-title">JARVIS</span>
           </div>
           <div className="panel-header-actions">
             <button
@@ -266,41 +220,15 @@ const Panel: React.FC<PanelProps> = ({
           </div>
         </div>
 
-        <div className="panel-view-switcher" role="tablist" aria-label="Panel views">
-          {VIEWS.map((v) => (
-            <button
-              key={v.id}
-              role="tab"
-              aria-selected={view === v.id}
-              className={`panel-view-tab ${view === v.id ? 'active' : ''}`}
-              onClick={() => onViewChange(v.id)}
-              tabIndex={view === v.id ? 0 : -1}
-            >
-              {v.label}
-            </button>
-          ))}
-        </div>
-
         <div className="panel-content" role="tabpanel">
           {isTransitioning ? (
             <LoadingSpinner size="sm" label="Loading..." />
           ) : (
             <>
-              {view === 'chat' && <ChatView />}
-              {view === 'memory' && <MemoryView />}
-              {view === 'files' && <FilesView />}
-              {view === 'models' && <ModelsView />}
-              {view === 'plugins' && <PluginsView />}
-              {view === 'settings' && <SettingsView />}
-              {view === 'tools' && <ToolsView />}
-              {view === 'tasks' && <TasksView />}
-              {view === 'automation' && <AutomationView />}
-              {view === 'adaptive' && <AdaptiveView />}
-              {view === 'proactive' && <ProactiveView />}
-              {view === 'security' && <SecurityView />}
-              {view === 'performance' && <PerformanceView />}
-              {view === 'projects' && <ProjectsView />}
-              {view === 'code' && <CodeView />}
+              {_view === 'chat' && <ChatView />}
+              {_view === 'settings' && (
+                <SettingsView initialSettings={settings} onSave={onSaveSettings} />
+              )}
             </>
           )}
         </div>

@@ -6,6 +6,8 @@ logger = logging.getLogger(__name__)
 
 
 class WebSearchTool(BaseTool):
+    risk_level = "read_only"
+    capability = "web"
     name = "web_search"
     description = "Search the web using DuckDuckGo"
     parameters = {

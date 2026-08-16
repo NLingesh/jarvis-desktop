@@ -79,6 +79,10 @@ function App() {
   const [quickActionsOpen, setQuickActionsOpen] = useState(false);
   const [_voiceMachineState, _setVoiceMachineState] = useState<VoiceState>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [activeConfirmation, setActiveConfirmation] = useState<{
+    tool: string;
+    prompt: string;
+  } | null>(null);
   const [settings, setSettings] = useState<SettingsState>(() => {
     const stored = localStorage.getItem('voiceSettings');
     let parsed: Partial<SettingsState> = {};
@@ -303,6 +307,14 @@ function App() {
     [],
   );
 
+  const sendConfirmation = useCallback((tool: string, confirm: boolean) => {
+    const socket = ws.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'confirm', tool, confirm }));
+    }
+    setActiveConfirmation(null);
+  }, []);
+
   const checkHealth = useCallback(async () => {
     logVoice('health', { level: 'debug' });
     const server = settings.serverUrl;
@@ -395,7 +407,11 @@ function App() {
 
     const connect = async () => {
       if (cancelled) return;
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) return;
+      if (
+        ws.current &&
+        (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING)
+      )
+        return;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -529,6 +545,16 @@ function App() {
             }
             if (pendingSegmentsRef.current > 0) {
               pendingSegmentsRef.current -= 1;
+            }
+          } else if (data.type === 'confirmations') {
+            const confirmations = data.confirmations || {};
+            const keys = Object.keys(confirmations);
+            if (keys.length > 0) {
+              const first = confirmations[keys[0]];
+              setActiveConfirmation({
+                tool: first.tool || keys[0],
+                prompt: first.confirmation_prompt || data.message || 'Please confirm this action.',
+              });
             }
           } else if (data.type === 'error') {
             const message = handleVoiceError('ws', data.message, 'Connection error');
@@ -671,15 +697,29 @@ function App() {
 
   const listeningRef = useRef(isListening);
   const processingRef = useRef(isProcessing);
+  const toggleCooldownRef = useRef(0);
   listeningRef.current = isListening;
   processingRef.current = isProcessing;
 
   const toggleTalk = useCallback(async () => {
+    console.log(
+      '[voice] toggleTalk called, processing=',
+      processingRef.current,
+      'listening=',
+      listeningRef.current,
+      'nativeListening=',
+      nativeListeningRef.current,
+    );
     if (processingRef.current) return;
+    const now = Date.now();
+    if (now - toggleCooldownRef.current < 800) return;
+    toggleCooldownRef.current = now;
     if (settingsRef.current.voiceMode === 'native') {
       const socket = ws.current;
+      console.log('[voice] native mode, socket readyState=', socket?.readyState);
       if (!socket || socket.readyState !== WebSocket.OPEN) return;
       if (listeningRef.current || nativeListeningRef.current) {
+        console.log('[voice] stopping listening');
         socket.send(JSON.stringify({ type: 'stop_listening' }));
         nativeListeningRef.current = false;
         setIsListening(false);
@@ -689,6 +729,7 @@ function App() {
         startProcessingWatchdogRef.current();
         return;
       }
+      console.log('[voice] starting listening');
       socket.send(JSON.stringify({ type: 'start_listening', mode: 'ptt' }));
       nativeListeningRef.current = true;
       setIsListening(true);
@@ -988,8 +1029,11 @@ function App() {
     const api = (window as any).electronAPI;
     if (!api?.onVoiceControl) return;
     const unsubscribe = api.onVoiceControl((action: string) => {
-      if (action === 'toggle' || action === 'start') toggleTalk();
-      else if (action === 'stop') {
+      console.log('[shortcut] voice-control received:', action);
+      if (action === 'toggle' || action === 'start') {
+        console.log('[shortcut] invoking toggleTalk');
+        toggleTalk();
+      } else if (action === 'stop') {
         if (listeningRef.current) toggleTalk();
       }
     });
@@ -1151,7 +1195,7 @@ function App() {
   }, []);
 
   const handleQuickAction = useCallback(
-    (action: 'talk' | 'chat' | 'memory' | 'tools') => {
+    (action: 'talk' | 'chat' | 'settings') => {
       setQuickActionsOpen(false);
       if (action === 'talk') {
         if (isElectron)
@@ -1257,20 +1301,20 @@ function App() {
               className={`orb-anchor ${isListening ? 'recording' : ''} ${windowMode === 'panel' ? 'orb-anchor-hidden' : ''}`}
               style={orbAnchorStyle as React.CSSProperties}
             >
-               <OrbEngine
-                 state={effectiveOrbState}
-                 rms={rms}
-                 onToggleTalk={toggleTalk}
-                 onExpandPanel={() => openPanel()}
-                 onSingleClick={openPanel}
-                 onQuickAction={handleQuickAction}
-                 onClick={handlePanelClose}
-                 onDragMove={handleOrbDragMove}
-                 onDragEnd={handleOrbDragEnd}
-                 onContextMenu={handleOrbContextMenu}
-                 quickActionsOpen={quickActionsOpen}
-                 onCloseQuickActions={closeQuickActions}
-               />
+              <OrbEngine
+                state={effectiveOrbState}
+                rms={rms}
+                onToggleTalk={toggleTalk}
+                onExpandPanel={() => openPanel()}
+                onSingleClick={openPanel}
+                onQuickAction={handleQuickAction}
+                onClick={handlePanelClose}
+                onDragMove={handleOrbDragMove}
+                onDragEnd={handleOrbDragEnd}
+                onContextMenu={handleOrbContextMenu}
+                quickActionsOpen={quickActionsOpen}
+                onCloseQuickActions={closeQuickActions}
+              />
             </div>
 
             {showTransientHud && (
@@ -1298,9 +1342,33 @@ function App() {
               onClose={handlePanelClose}
               orbPosition={orbPosition}
               onToggleTalk={handlePanelToggleTalk}
+              settings={settings}
+              onSaveSettings={(next) => {
+                setSettings(next);
+                try {
+                  localStorage.setItem('voiceSettings', JSON.stringify(next));
+                  window.dispatchEvent(new CustomEvent('jarvis-settings-change'));
+                } catch {
+                  /* ignore */
+                }
+              }}
               fillWindow={isElectron}
             />
           </main>
+
+          {showTransientHud && activeConfirmation && (
+            <div className="confirmation-dialog" role="dialog" aria-live="assertive">
+              <p>{activeConfirmation.prompt}</p>
+              <div className="confirmation-actions">
+                <button onClick={() => sendConfirmation(activeConfirmation.tool, true)}>
+                  Confirm
+                </button>
+                <button onClick={() => sendConfirmation(activeConfirmation.tool, false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
 
           {showTransientHud && error && (
             <div className="error-banner" role="alert" aria-live="assertive">

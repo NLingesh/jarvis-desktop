@@ -62,6 +62,69 @@ const HEALTH_CHECK_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}/health`;
 const STARTUP_TIMEOUT_MS = 120000;
 const POLL_INTERVAL_MS = 500;
 
+function getAutostartPath() {
+  return path.join(app.getPath('home'), '.config', 'autostart', 'jarvis-electron.desktop');
+}
+
+function getStartMinimizedPath() {
+  return path.join(app.getPath('userData'), 'start-minimized.json');
+}
+
+function isAutostartEnabled() {
+  try {
+    return fs.existsSync(getAutostartPath());
+  } catch (e) {
+    return false;
+  }
+}
+
+function setAutostartEnabled(enabled) {
+  const autostartDir = path.dirname(getAutostartPath());
+  try {
+    if (!fs.existsSync(autostartDir)) {
+      fs.mkdirSync(autostartDir, { recursive: true });
+    }
+    if (enabled) {
+      const desktopEntry = `[Desktop Entry]
+Type=Application
+Exec=${process.execPath} --no-sandbox
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name=JARVIS
+Comment=Start JARVIS with system
+`;
+      fs.writeFileSync(getAutostartPath(), desktopEntry);
+    } else {
+      if (fs.existsSync(getAutostartPath())) {
+        fs.unlinkSync(getAutostartPath());
+      }
+    }
+  } catch (e) {
+    log(`Failed to ${enabled ? 'enable' : 'disable'} autostart: ${e.message}`);
+  }
+}
+
+function isStartMinimizedEnabled() {
+  try {
+    const p = getStartMinimizedPath();
+    if (!fs.existsSync(p)) return false;
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return !!data.enabled;
+  } catch (e) {
+    return false;
+  }
+}
+
+function setStartMinimizedEnabled(enabled) {
+  try {
+    const p = getStartMinimizedPath();
+    fs.writeFileSync(p, JSON.stringify({ enabled }));
+  } catch (e) {
+    log(`Failed to save start-minimized setting: ${e.message}`);
+  }
+}
+
 // The Markdown vault folder that the backend reads/writes. Mirrors the
 // backend's own resolution so the IPC "open vault" action opens the same dir.
 function getVaultPath() {
@@ -354,6 +417,23 @@ function createWindow() {
   mainWindow.loadURL(`http://${BACKEND_HOST}:${BACKEND_PORT}`);
   windowMode = 'orb';
 
+  // Restrict navigation to the local backend origin so the preload bridge
+  // (which exposes the session token and keychain API) can never be handed to
+  // an untrusted page.
+  const allowedOrigin = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith(allowedOrigin)) {
+      event.preventDefault();
+    }
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith(allowedOrigin)) return { action: 'allow' };
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+
   mainWindow.on('moved', () => {
     const c = currentOrbCenter();
     saveOrbPosition(c.x, c.y);
@@ -598,26 +678,49 @@ async function init() {
     await setupFirstRun();
   }
 
-  startBackend();
+  const alreadyHealthy = await waitForBackend(2000);
+  if (!alreadyHealthy) {
+    startBackend();
+    const ready = await waitForBackend(STARTUP_TIMEOUT_MS);
+    if (!ready) {
+      const detail = backendStdout || '(no stdout)';
+      const stderr = backendStderr || '(no stderr)';
+      const fullDetail = `STDOUT:\n${detail}\n\nSTDERR:\n${stderr}`;
 
-  const ready = await waitForBackend(STARTUP_TIMEOUT_MS);
-
-  if (!ready) {
-    const detail = backendStdout || '(no stdout)';
-    const stderr = backendStderr || '(no stderr)';
-    const fullDetail = `STDOUT:\n${detail}\n\nSTDERR:\n${stderr}`;
-
-    dialog.showErrorBox(
-      'JARVIS Backend Failed to Start',
-      `The backend server did not become ready within ${STARTUP_TIMEOUT_MS / 1000} seconds.\n\n` +
-      `Health check URL: ${HEALTH_CHECK_URL}\n\n` +
-      `Backend output:\n${fullDetail}`
-    );
-    app.quit();
-    return;
+      dialog.showErrorBox(
+        'JARVIS Backend Failed to Start',
+        `The backend server did not become ready within ${STARTUP_TIMEOUT_MS / 1000} seconds.\n\n` +
+        `Health check URL: ${HEALTH_CHECK_URL}\n\n` +
+        `Backend output:\n${fullDetail}`
+      );
+      app.quit();
+      return;
+    }
+  } else {
+    log('Reusing existing backend');
+    try {
+      const tokenResult = await new Promise((resolve) => {
+        http.get(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/session-token`, (res) => {
+          let body = '';
+          res.on('data', (chunk) => { body += chunk; });
+          res.on('end', () => resolve(body));
+        }).on('error', () => resolve(null));
+      });
+      if (tokenResult) {
+        const parsed = JSON.parse(tokenResult);
+        if (parsed.token) {
+          sessionToken = parsed.token;
+          log('Retrieved existing session token');
+        }
+      }
+    } catch (err) {
+      log(`Failed to retrieve session token: ${err.message}`);
+    }
   }
 
-  createWindow();
+  if (!isStartMinimizedEnabled()) {
+    createWindow();
+  }
   createTray();
 
   // Ctrl+Space toggles the voice session from anywhere on the desktop (the orb
@@ -625,7 +728,9 @@ async function init() {
   const voiceShortcut = process.env.VOICE_SHORTCUT || 'Control+Space';
   try {
     globalShortcut.register(voiceShortcut, () => {
+      log('[shortcut] Ctrl+Space received');
       sendToRenderer('voice-control', 'toggle');
+      log('[shortcut] invoked voice-control toggle');
     });
     log(`Registered global shortcut: ${voiceShortcut}`);
   } catch (err) {
@@ -835,6 +940,24 @@ ipcMain.handle('retrieve-api-keys', async () => {
 ipcMain.handle('delete-api-key', async (_event, keyName) => {
   if (!keytar) return { success: false, error: 'keytar unavailable' };
   await keytar.deletePassword(KEYCHAIN_SERVICE, keyName);
+  return { success: true };
+});
+
+ipcMain.handle('get-autostart-enabled', () => {
+  return isAutostartEnabled();
+});
+
+ipcMain.handle('set-autostart-enabled', (_event, enabled) => {
+  setAutostartEnabled(enabled);
+  return { success: true };
+});
+
+ipcMain.handle('get-start-minimized', () => {
+  return isStartMinimizedEnabled();
+});
+
+ipcMain.handle('set-start-minimized', (_event, enabled) => {
+  setStartMinimizedEnabled(enabled);
   return { success: true };
 });
 

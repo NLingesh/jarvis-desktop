@@ -16,11 +16,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import FileResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 
 from managers.native_audio import list_input_devices
 from managers.native_voice import NativeVoiceSession
@@ -47,17 +47,21 @@ from routes.state import (
     audio_manager,
     auth_service,
     calendar,
+    get_dev_session_token,
     handle_user_input,
+    handle_ws_confirm,
     llm,
     mail_sessions,
     memory_manager,
     model_manager,
+    pending_tool_confirmations,
     plugin_registry,
     stream_speech_to_socket,
     stt,
     stt_manager,
     system_actions,
     task_manager,
+    tool_registry,
     tts,
     tts_manager,
     validate_ws_token,
@@ -66,6 +70,7 @@ from routes.state import (
     voice_manager,
     workflow_manager,
 )
+from modules.limits import audio_chunk_allowed, legacy_audio_blob_allowed
 from routes.stt import router as stt_router
 from routes.system import router as system_router
 from routes.tasks import router as tasks_router
@@ -129,7 +134,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._requests.setdefault(client_ip, [])
         self._requests[client_ip] = [t for t in self._requests[client_ip] if t > window_start]
         if len(self._requests[client_ip]) >= self.max_requests:
-            raise HTTPException(status_code=429, detail="Too many requests")
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests"},
+            )
         self._requests[client_ip].append(now)
         return await call_next(request)
 
@@ -304,6 +312,17 @@ async def health():
             "vision": vision_manager.diagnostics(),
         },
     }
+
+
+@app.get("/api/session-token")
+async def session_token(request: Request):
+    data = get_dev_session_token(request)
+    if data is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Session token is only served to loopback clients in the local development context",
+        )
+    return data
 
 
 @app.get("/api/voice/diagnostics")
@@ -481,6 +500,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.warning("[voice:%s] invalid audio chunk: %s", voice_uid, e)
                     await websocket.send_json({"type": "error", "message": "Invalid audio chunk"})
                     continue
+                if not audio_chunk_allowed(len(pcm), audio_bytes):
+                    logger.warning(
+                        "[voice:%s] audio chunk exceeds limits, discarding utterance", voice_uid
+                    )
+                    await websocket.send_json(
+                        {"type": "error", "message": "Audio chunk too large"}
+                    )
+                    pending_stream.abandon()
+                    pending_stream = None
+                    continue
                 audio_bytes += len(pcm)
                 pending_stream.feed(pcm)
             elif msg_type == "audio_end":
@@ -498,7 +527,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 pending_stream = None
                 if not user_input:
                     continue
-                logger.info("[voice:%s] User (voice): %s", voice_uid, user_input)
+                logger.info("[voice:%s] User (voice) %d chars", voice_uid, len(user_input))
                 await handle_user_input(user_input, session_id, websocket, voice_uid)
             elif msg_type == "audio":
                 # Legacy whole-blob payload (backwards compatible).
@@ -509,6 +538,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "error",
                             "message": "audio_base64 is required",
                         }
+                    )
+                    continue
+                # Bound the decoded payload before it reaches the recognizer.
+                if not legacy_audio_blob_allowed(len(audio_base64)):
+                    await websocket.send_json(
+                        {"type": "error", "message": "Audio payload too large"}
                     )
                     continue
                 await websocket.send_json({"type": "status", "status": "transcribing"})
@@ -532,8 +567,35 @@ async def websocket_endpoint(websocket: WebSocket):
                         }
                     )
                     continue
-                logger.info("[voice:%s] User (voice): %s", voice_uid, user_input)
+                logger.info("[voice:%s] User (voice) %d chars", voice_uid, len(user_input))
                 await handle_user_input(user_input, session_id, websocket, voice_uid)
+            elif msg_type == "confirm":
+                tool_name = data.get("tool")
+                confirm = bool(data.get("confirm", False))
+                pending = pending_tool_confirmations.get(session_id)
+                if pending and pending.get("tool") == tool_name:
+                    if confirm:
+                        tool_args = pending.get("args", {})
+                        tool_args["confirm"] = True
+                        try:
+                            result = await tool_registry.execute_tool(tool_name, tool_args)
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": f"Done. {result.data if result.success else result.error}",
+                            })
+                        except Exception as exc:
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": f"Action failed: {exc}",
+                            })
+                    else:
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": "Action cancelled.",
+                        })
+                    pending_tool_confirmations.pop(session_id, None)
+                else:
+                    await handle_ws_confirm(session_id, tool_name, confirm, websocket, voice_uid)
 
     except TimeoutError:
         logger.info("[voice:%s] idle timeout, closing session %s", voice_uid, session_id)
@@ -557,18 +619,30 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 NATIVE_VOICE_TIMEOUT = 120
 
+# An utterance whose peak-normalized RMS stays below this is effectively
+# silence — report "no usable signal" instead of a generic transcription error.
+NO_USABLE_SIGNAL_RMS = 0.005
+
 
 async def _native_transcribe(session, pcm: bytes, websocket, voice_uid: str) -> str:
-    """Transcribe a captured utterance using the STT manager."""
+    """Transcribe a captured utterance using the STT manager.
+
+    Reports precise, local-first failure messages instead of a generic error
+    when the microphone path is at fault (no device / muted / no signal).
+    """
     if not pcm:
         with contextlib.suppress(Exception):
             await websocket.send_json(
                 {"type": "error", "message": "I didn't catch any audio. Please speak again."}
             )
         return ""
+    rms, peak = _pcm_level(pcm)
+    muted = _source_muted(session)
     try:
         async with STT_SEMAPHORE:
+            started = time.monotonic()
             user_input = await asyncio.to_thread(stt_manager.transcribe_pcm16, pcm, 16000)
+            took_ms = (time.monotonic() - started) * 1000
     except Exception as e:
         logger.error("[voice:%s] native STT failed: %s", voice_uid, e)
         with contextlib.suppress(Exception):
@@ -576,14 +650,141 @@ async def _native_transcribe(session, pcm: bytes, websocket, voice_uid: str) -> 
                 {"type": "error", "message": f"Speech recognition failed: {e}"}
             )
         return ""
+    _log_native_stt_diagnostic(session, pcm, rms, peak, muted, user_input, took_ms, voice_uid)
     if not user_input:
-        detail = (
-            "I heard audio but could not transcribe it. If this keeps happening, "
-            "check that the STT model is installed and the microphone gain is up."
+        if muted is True:
+            detail = "Microphone is muted."
+        elif rms < NO_USABLE_SIGNAL_RMS:
+            detail = "No usable microphone signal detected."
+        else:
+            detail = "Audio received, but no speech was recognized."
+        logger.info(
+            "[voice:%s] native STT no text (rms=%.4f peak=%.4f muted=%s): %s",
+            voice_uid,
+            rms,
+            peak,
+            muted,
+            detail,
         )
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": detail})
     return user_input
+
+
+def _pcm_level(pcm: bytes) -> tuple[float, float]:
+    """Compute (rms, peak) of PCM16 audio without logging any samples."""
+    if not pcm:
+        return 0.0, 0.0
+    try:
+        import array
+
+        samples = array.array("h", pcm)
+        n = len(samples)
+        if n == 0:
+            return 0.0, 0.0
+        total = 0.0
+        peak = 0
+        for v in samples:
+            av = abs(v)
+            total += av * av
+            if av > peak:
+                peak = av
+        rms = (total / n) ** 0.5 / 32768.0
+        return rms, peak / 32768.0
+    except Exception:
+        return 0.0, 0.0
+
+
+def _source_muted(session) -> bool | None:
+    """Best-effort mute detection for the active input source (never raises)."""
+    try:
+        if session is None or session.mic is None:
+            return None
+        device_id = session.mic.device_info().get("id")
+        from managers.native_audio import source_mute_state
+
+        return source_mute_state(device_id)
+    except Exception:
+        return None
+
+
+def _native_connect_message(reason: str, session) -> str:
+    """Map a microphone open failure to a clear, local-first message.
+
+    Local microphone problems must not be reported as generic network/STT
+    errors — the user needs to know it is the input device that failed.
+    """
+    low = reason.lower()
+    if "no input device" in low or "no usable input" in low:
+        return "No microphone detected."
+    if "sounddevice" in low or "portaudio" in low:
+        return "No microphone detected."
+    muted = _source_muted(session)
+    if muted is True:
+        return "Microphone is muted."
+    if "device" in low and ("invalid" in low or "error" in low or "unavailable" in low):
+        return "No microphone detected."
+    return f"Could not open the microphone: {reason}"
+
+
+def _log_native_stt_diagnostic(
+    session, pcm: bytes, rms: float, peak: float, muted: bool | None, user_input: str,
+    took_ms: float, voice_uid: str,
+) -> None:
+    """Log safe STT diagnostics: device/source, selected status, level, timing.
+
+    Logs device id + name, whether the device is the PortAudio default,
+    capture sample rate, channel count, RMS/peak, byte count, chunk count,
+    mute state, model state, and transcript length.  Never logs raw audio,
+    API keys, credentials, or transcript content.
+    """
+    device_id = None
+    device_name = ""
+    capture_rate = 16000
+    sample_rate = 16000
+    channels = 1
+    is_default = None
+    with contextlib.suppress(Exception):
+        info = session.mic.device_info() if session is not None else {}
+        device_id = info.get("id")
+        device_name = info.get("name") or ""
+        capture_rate = info.get("capture_rate") or 16000
+        sample_rate = info.get("sample_rate") or 16000
+        channels = 1
+        devices = list_input_devices()
+        if device_id is not None:
+            is_default = any(d.get("is_default") for d in devices if d.get("id") == device_id)
+    samples = len(pcm) // 2
+    block_samples = max(int(sample_rate * 30 / 1000), 1)
+    chunks = (samples + block_samples - 1) // block_samples
+    model_ready = None
+    model_loaded = None
+    with contextlib.suppress(Exception):
+        diag = stt_manager.diagnostics()
+        model_ready = diag.get("ready")
+        model_loaded = diag.get("vosk_loaded")
+    logger.info(
+        "[voice:%s] stt: device=%s name=%r default=%s sr=%d capture_rate=%d ch=%d "
+        "samples=%d bytes=%d chunks=%d rms=%.4f peak=%.4f muted=%s "
+        "model_ready=%s model_loaded=%s took=%.0fms transcript_chars=%d",
+        voice_uid,
+        device_id,
+        device_name,
+        is_default,
+        sample_rate,
+        capture_rate,
+        channels,
+        samples,
+        len(pcm),
+        chunks,
+        rms,
+        peak,
+        muted,
+        model_ready,
+        model_loaded,
+        took_ms,
+        len(user_input),
+    )
 
 
 @app.websocket("/ws/voice/native")
@@ -638,7 +839,7 @@ async def native_voice_endpoint(websocket: WebSocket):
         if not user_input:
             _emit_state("IDLE", "no speech detected")
             return
-        logger.info("[voice:%s] User (native voice): %s", voice_uid, user_input)
+        logger.info("[voice:%s] User (native voice) %d chars", voice_uid, len(user_input))
         _emit_state("PROCESSING", "stt complete")
         await handle_user_input(user_input, session_id, websocket, voice_uid)
         _emit_state("IDLE", "utterance complete")
@@ -662,9 +863,9 @@ async def native_voice_endpoint(websocket: WebSocket):
                     session.set_device(data.get("device") or session._device)
                 await websocket.send_json({"type": "devices", "devices": list_input_devices()})
                 if not session.connect():
-                    await websocket.send_json(
-                        {"type": "error", "message": session.diagnostics().get("error")}
-                    )
+                    reason = session.diagnostics().get("error") or "failed to open microphone"
+                    message = _native_connect_message(reason, session)
+                    await websocket.send_json({"type": "error", "message": message})
             elif msg_type == "get_devices":
                 await websocket.send_json({"type": "devices", "devices": list_input_devices()})
             elif msg_type == "set_device":
@@ -688,8 +889,9 @@ async def native_voice_endpoint(websocket: WebSocket):
                 mode = data.get("mode", "ptt")
                 ok = session.start_listening(mode)
                 if not ok:
+                    reason = session.diagnostics().get("error") or "failed to start listening"
                     await websocket.send_json(
-                        {"type": "error", "message": session.diagnostics().get("error")}
+                        {"type": "error", "message": _native_connect_message(reason, session)}
                     )
             elif msg_type == "stop_listening":
                 if session is not None:
@@ -717,6 +919,33 @@ async def native_voice_endpoint(websocket: WebSocket):
                 if session is not None:
                     session.disconnect()
                 await websocket.send_json({"type": "mic_test", "status": "stopped"})
+            elif msg_type == "confirm":
+                tool_name = data.get("tool")
+                confirm = bool(data.get("confirm", False))
+                pending = pending_tool_confirmations.get(session_id)
+                if pending and pending.get("tool") == tool_name:
+                    if confirm:
+                        tool_args = pending.get("args", {})
+                        tool_args["confirm"] = True
+                        try:
+                            result = await tool_registry.execute_tool(tool_name, tool_args)
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": f"Done. {result.data if result.success else result.error}",
+                            })
+                        except Exception as exc:
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": f"Action failed: {exc}",
+                            })
+                    else:
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": "Action cancelled.",
+                        })
+                    pending_tool_confirmations.pop(session_id, None)
+                else:
+                    await handle_ws_confirm(session_id, tool_name, confirm, websocket, voice_uid)
 
     except TimeoutError:
         logger.info("[voice:%s] native idle timeout, closing session %s", voice_uid, session_id)
@@ -749,9 +978,15 @@ if os.path.isdir(frontend_dist):
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
         """Serve frontend SPA - all non-API routes return index.html"""
-        file_path = os.path.join(frontend_dist, full_path)
-        if full_path and os.path.isfile(file_path):
-            return FileResponse(file_path)
+        if not full_path or full_path.startswith("api/"):
+            return FileResponse(os.path.join(frontend_dist, "index.html"))
+        requested = os.path.abspath(os.path.join(frontend_dist, full_path))
+        dist_root = os.path.abspath(frontend_dist)
+        # Refuse traversal: only files physically inside the dist tree are served.
+        if requested != dist_root and not requested.startswith(dist_root + os.sep):
+            return FileResponse(os.path.join(frontend_dist, "index.html"))
+        if os.path.isfile(requested):
+            return FileResponse(requested)
         return FileResponse(os.path.join(frontend_dist, "index.html"))
 
 

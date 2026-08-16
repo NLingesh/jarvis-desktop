@@ -479,8 +479,10 @@ class VaultManager:
         )
 
     async def get_daily_notes(self, limit: int = 30) -> list[dict]:
-        """List recent daily notes."""
-        return await self.search_notes(folder="Daily Notes", limit=limit)
+        """List recent daily notes (newest first)."""
+        notes = await self.scan_notes(folder="Daily Notes")
+        notes.sort(key=lambda r: r.get("modified") or "", reverse=True)
+        return notes[:limit]
 
     # --- Graph / links --------------------------------------------------------
     async def get_note_graph(self, limit: int = 100) -> dict:
