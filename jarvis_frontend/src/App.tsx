@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import './App.css';
-import OrbEngine from './orb/OrbEngine';
+import MinimalBubble from './components/MinimalBubble';
 import { Panel, PanelView } from './panel';
 import { computeRms, uint8ToBase64 } from './audioStream';
 import {
@@ -19,9 +19,7 @@ import type { OrbState } from './orb/OrbEngine';
 const PCM_WORKLET_URL = '/pcmWorklet.js';
 
 // Single expanding window geometry (mirrors electron/main.js MODE_SPECS).
-const ORB_WINDOW = 96;
-const MENU_WINDOW = 240;
-const PANEL_ANCHOR = { x: 190, y: 520 };
+const PANEL_ANCHOR = { x: 320, y: 320 };
 const ORB_POSITION_KEY = 'jarvisOrbPosition';
 
 type WindowMode = 'orb' | 'menu' | 'panel';
@@ -30,6 +28,56 @@ const ENDPOINT_SILENCE_MS = 900;
 
 function getElectronAPI(): any {
   return (window as any).electronAPI;
+}
+
+type ChatToolResult = {
+  tool?: string;
+  result?: { success?: boolean; data?: Record<string, unknown> };
+};
+
+// Build a short, verified summary line for tools that actually ran and
+// succeeded.  Lines whose detail is already present in the backend reply are
+// skipped so a deterministic "Opened /home/wiz/Downloads." is not duplicated.
+function summarizeVerifiedTools(tools: unknown, reply: string): string[] {
+  const list = Array.isArray(tools) ? (tools as ChatToolResult[]) : [];
+  const notes: string[] = [];
+  for (const t of list) {
+    if (!t || !t.result || !t.result.success) continue;
+    const data = (t.result.data || {}) as Record<string, unknown>;
+    const detail = ['opened', 'launched', 'url', 'terminal']
+      .map((key) => data[key])
+      .find((value) => typeof value === 'string' && value);
+    if (detail === undefined) {
+      notes.push(`✓ ${t.tool || 'action'} completed`);
+      continue;
+    }
+    if (reply.includes(String(detail))) continue;
+    notes.push(`✓ ${t.tool || 'action'}: ${detail}`);
+  }
+  return notes;
+}
+
+// Format verified tool executions from voice responses as "✓ tool: arg"
+// lines so a completed desktop action is visibly attached to its assistant
+// reply (e.g. "✓ launch_application: vs code").
+export function summarizeVoiceToolResults(tools: unknown): string[] {
+  const list = Array.isArray(tools) ? tools : [];
+  const lines: string[] = [];
+  for (const t of list) {
+    if (!t || typeof t !== 'object') continue;
+    const tool = String((t as { tool?: unknown }).tool || '').trim();
+    if (!tool) continue;
+    if ((t as { verified?: unknown }).verified === false) continue;
+    const args = (t as { args?: Record<string, unknown> }).args;
+    let argText = '';
+    if (args && typeof args === 'object') {
+      argText = Object.values(args)
+        .filter((v) => typeof v === 'string' && v.trim())
+        .join(', ');
+    }
+    lines.push(argText ? `✓ ${tool}: ${argText}` : `✓ ${tool}`);
+  }
+  return lines;
 }
 
 type SettingsState = {
@@ -112,10 +160,29 @@ function App() {
   const [_sheetState, setSheetState] = useState<'hidden' | 'transcript' | 'response'>('hidden');
   const [liveTranscript, setLiveTranscript] = useState('');
   const [assistantText, setAssistantText] = useState('');
+  const [typedPrompt, setTypedPrompt] = useState('');
+  const [conversation, setConversation] = useState<
+    Array<{ role: 'user' | 'assistant'; text: string }>
+  >([]);
+  const conversationEndRef = useRef<HTMLDivElement>(null);
+  const lastPromptRef = useRef('');
+  const lastUserPushedRef = useRef('');
+  const lastRealTranscriptRef = useRef('');
+  const [isTextSubmitting, setIsTextSubmitting] = useState(false);
   const liveTranscriptRef = useRef(liveTranscript);
   liveTranscriptRef.current = liveTranscript;
   const assistantTextRef = useRef(assistantText);
   assistantTextRef.current = assistantText;
+
+  const pushConversation = useCallback((role: 'user' | 'assistant', text: string) => {
+    const clean = (text || '').trim();
+    if (!clean) return;
+    setConversation((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === role && last.text === clean) return prev;
+      return [...prev, { role, text: clean }];
+    });
+  }, []);
   const [showOnboarding, setShowOnboarding] = useState(() => {
     return localStorage.getItem('jarvisOnboarded') !== 'true';
   });
@@ -135,8 +202,15 @@ function App() {
   });
   const [rms, setRms] = useState(0);
   const isElectron = useMemo(() => !!getElectronAPI()?.setWindowMode, []);
-  const dragStartPosRef = useRef<{ x: number; y: number } | null>(null);
+  const [windowDragging, setWindowDragging] = useState(false);
   const errorTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const [micNotice, setMicNotice] = useState<string | null>(null);
+  const micNoticeTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const showMicNotice = useCallback((text: string) => {
+    setMicNotice(text);
+    if (micNoticeTimerRef.current) clearTimeout(micNoticeTimerRef.current);
+    micNoticeTimerRef.current = setTimeout(() => setMicNotice(null), 4500);
+  }, []);
 
   const ws = useRef<WebSocket | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
@@ -146,6 +220,26 @@ function App() {
   const isPlayingAudioRef = useRef(false);
   const pendingSegmentsRef = useRef(0);
   const enqueueAudioRef = useRef<(audioBase64: string) => void>(() => {});
+  const playbackSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const playbackTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const stopPlayback = useCallback(() => {
+    audioQueueRef.current = [];
+    pendingSegmentsRef.current = 0;
+    if (playbackTimerRef.current) {
+      clearTimeout(playbackTimerRef.current);
+      playbackTimerRef.current = undefined;
+    }
+    if (playbackSourceRef.current) {
+      try {
+        playbackSourceRef.current.stop();
+      } catch {
+        /* already stopped */
+      }
+      playbackSourceRef.current = null;
+    }
+    isPlayingAudioRef.current = false;
+    if (orbStateRef.current === 'speaking') setOrbState('idle');
+  }, []);
   const lastActivityRef = useRef(Date.now());
   const streamRef = useRef<MediaStream | null>(null);
   const isConnectedRef = useRef(false);
@@ -176,6 +270,7 @@ function App() {
   const nativeReadyRef = useRef(false);
   const nativeListeningRef = useRef(false);
   const nativeDevicesRef = useRef<Array<{ id: number; name: string }>>([]);
+  const serverBuildRef = useRef<string | null>(null);
 
   useEffect(() => {
     const syncSettings = () => {
@@ -204,6 +299,7 @@ function App() {
   }, []);
 
   const closePanel = useCallback(() => {
+    stopPlayback();
     if (listeningRef.current || nativeListeningRef.current) {
       const socket = ws.current;
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -225,7 +321,7 @@ function App() {
       getElectronAPI()?.setWindowMode?.('orb');
     }
     setWindowMode('orb');
-  }, [isElectron]);
+  }, [isElectron, stopPlayback]);
 
   const openPanel = useCallback(
     (view?: PanelView) => {
@@ -313,6 +409,12 @@ function App() {
       socket.send(JSON.stringify({ type: 'confirm', tool, confirm }));
     }
     setActiveConfirmation(null);
+    if (confirm) {
+      // An approved action is genuinely executing now; show controlled
+      // progress until the verified response arrives.
+      setOrbState('working');
+      setIsProcessing(true);
+    }
   }, []);
 
   const checkHealth = useCallback(async () => {
@@ -390,7 +492,11 @@ function App() {
           /* ignore */
         }
       }
-      await tryGetUserMediaWithRetry({ audio: true });
+      // This is only a permission probe. Always release the temporary stream;
+      // leaving it open prevents the real capture stream below from opening
+      // on PipeWire/ALSA and makes the mic appear to be permanently busy.
+      const probeStream = await tryGetUserMediaWithRetry({ audio: true });
+      probeStream.getTracks().forEach((track) => track.stop());
       micPermissionGrantedRef.current = true;
       return true;
     } catch (err) {
@@ -453,7 +559,31 @@ function App() {
             setError('Invalid data from server');
             return;
           }
-          if (data.type === 'state' && settingsRef.current.voiceMode === 'native') {
+          if (data.type === 'server' && data.build) {
+            // The backend restarted with a different frontend bundle than the
+            // one this renderer loaded. Reload so the running UI always matches
+            // the served build (never a stale bundle with old endpoints).
+            if (serverBuildRef.current && serverBuildRef.current !== data.build) {
+              const api = (window as any).electronAPI;
+              if (api?.reloadWindow) api.reloadWindow();
+              else window.location.reload();
+              return;
+            }
+            serverBuildRef.current = data.build;
+          } else if (data.type === 'window_action') {
+            const action = data.action || 'show_main';
+            const api = (window as any).electronAPI;
+            if (api?.showMainWindow && action === 'show_main') {
+              api.showMainWindow();
+            } else if (api?.toggleMainWindow) {
+              api.toggleMainWindow();
+            }
+            if (data.request_id && ws.current && ws.current.readyState === WebSocket.OPEN) {
+              ws.current.send(
+                JSON.stringify({ type: 'window_action_ack', request_id: data.request_id }),
+              );
+            }
+          } else if (data.type === 'state' && settingsRef.current.voiceMode === 'native') {
             nativeReadyRef.current = data.state === 'READY' || data.state === 'LISTENING';
             nativeListeningRef.current = data.state === 'LISTENING';
             setIsListening(data.state === 'LISTENING');
@@ -464,7 +594,9 @@ function App() {
               setOrbState('thinking');
               setIsProcessing(true);
             } else if (data.state === 'SPEAKING') {
-              setOrbState('speaking');
+              // The backend synthesizes speech (TTS); actual "speaking" state
+              // is set by playNextAudio only once playback begins.
+              setOrbState('thinking');
             } else if (data.state === 'READY' || data.state === 'IDLE') {
               setIsProcessing(false);
               setIsListening(false);
@@ -487,7 +619,18 @@ function App() {
           } else if (data.type === 'pong') {
             awaitingPongRef.current = false;
           } else if (data.type === 'response') {
-            setAssistantText(data.text);
+            const spoken = (lastRealTranscriptRef.current || '').trim();
+            if (spoken && spoken !== lastUserPushedRef.current) {
+              lastUserPushedRef.current = spoken;
+              pushConversation('user', spoken);
+            }
+            const toolLines = summarizeVoiceToolResults(data.tool_results);
+            const text = String(data.text || '');
+            const display = toolLines.length
+              ? `${toolLines.join('\n')}${text ? `\n${text}` : ''}`
+              : text;
+            pushConversation('assistant', display);
+            setAssistantText(display);
             setSheetState('response');
             lastActivityRef.current = Date.now();
             if (data.audio) enqueueAudioRef.current(data.audio);
@@ -496,11 +639,10 @@ function App() {
               processingTimerRef.current = undefined;
             }
             setIsProcessing(false);
-            // Only show the orb as speaking if there is queued/playing audio;
-            // otherwise return straight to idle so the UI never sticks.
-            if (audioQueueRef.current.length > 0 || isPlayingAudioRef.current) {
-              setOrbState('speaking');
-            } else {
+            // Speaking state is set by playNextAudio only when playback of
+            // decoded audio actually starts; here we only drop back to idle
+            // when nothing is queued or playing so the orb never lies.
+            if (audioQueueRef.current.length === 0 && !isPlayingAudioRef.current) {
               setOrbState('idle');
             }
             _setVoiceMachineState((prev) => transition(prev, 'audio_finished', getVoiceContext()));
@@ -509,20 +651,20 @@ function App() {
             setSheetState('response');
             lastActivityRef.current = Date.now();
           } else if (data.type === 'transcript') {
+            lastRealTranscriptRef.current = data.text;
             setLiveTranscript(data.text);
             lastActivityRef.current = Date.now();
           } else if (data.type === 'status') {
             if (data.status === 'processing') setOrbState('thinking');
-            else if (data.status === 'generating_speech') setOrbState('speaking');
           } else if (data.type === 'proactive') {
             if (data.text) {
+              pushConversation('assistant', data.text);
               setAssistantText(data.text);
               setSheetState('response');
               lastActivityRef.current = Date.now();
             }
           } else if (data.type === 'audio_queue') {
             pendingSegmentsRef.current = data.count ?? 0;
-            setOrbState('speaking');
           } else if (data.type === 'audio_segment_start') {
             audioChunksRef.current = [];
           } else if (data.type === 'audio_chunk' && data.chunk) {
@@ -556,17 +698,45 @@ function App() {
                 prompt: first.confirmation_prompt || data.message || 'Please confirm this action.',
               });
             }
+          } else if (data.type === 'voice_status') {
+            // Microphone-cycle statuses (e.g. no-speech) are subtle and
+            // non-blocking: they never raise the red error card, never attach
+            // to a completed command's result, and never interrupt playback.
+            if (data.status === 'no_speech') {
+              showMicNotice(String(data.message || "I didn't catch that. Try again."));
+            }
           } else if (data.type === 'error') {
-            const message = handleVoiceError('ws', data.message, 'Connection error');
+            // Native microphone/STT errors arrive over this same socket, but they
+            // are not network failures. Preserve the recognizer's useful message
+            // instead of translating it into a misleading "Network error".
+            const nativeMic = settingsRef.current.voiceMode === 'native';
+            const nativeMessage = String(data.message || 'Microphone/audio error');
+            // Defensive: a no-speech message that still arrives as type "error"
+            // (e.g. from an older backend) must degrade to a subtle mic notice,
+            // not a red error card.
+            const looksLikeNoSpeech =
+              /no speech was recognized|didn't catch any audio|could not hear any speech/i.test(
+                nativeMessage,
+              );
+            if (looksLikeNoSpeech && data.error_scope !== 'stream') {
+              showMicNotice("I didn't catch that. Try again.");
+              return;
+            }
+            const message = nativeMic
+              ? nativeMessage
+              : handleVoiceError('ws', data.message, 'Connection error');
             setError(message);
             setOrbState('idle');
+            stopPlayback();
             if (processingTimerRef.current) {
               clearTimeout(processingTimerRef.current);
               processingTimerRef.current = undefined;
             }
             setIsProcessing(false);
             setSheetState('hidden');
-            _setVoiceMachineState((prev) => transition(prev, 'ws_failed', getVoiceContext()));
+            _setVoiceMachineState((prev) =>
+              transition(prev, nativeMic ? 'mic_denied' : 'ws_failed', getVoiceContext()),
+            );
           }
         };
         ws.current.onerror = () => {
@@ -575,6 +745,7 @@ function App() {
             new Error('WebSocket connection error'),
             'Connection error',
           );
+          stopPlayback();
           setError(message);
           isConnectedRef.current = false;
           setIsProcessing(false);
@@ -582,7 +753,14 @@ function App() {
         };
         ws.current.onclose = () => {
           isConnectedRef.current = false;
+          stopPlayback();
           setIsProcessing(false);
+          setIsListening(false);
+          nativeListeningRef.current = false;
+          nativeReadyRef.current = false;
+          if (orbStateRef.current === 'listening') {
+            setOrbState('idle');
+          }
           if (reconnectTimer) clearTimeout(reconnectTimer);
           reconnectTimer = setTimeout(() => {
             reconnectDelay = Math.min(reconnectDelay * 2, 60000);
@@ -679,20 +857,42 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let raf: number;
-    const updateRms = () => {
-      if (analysers.current[0]) {
+    let raf: number | undefined;
+    let idleTimer: ReturnType<typeof setInterval> | undefined;
+    let last = 0;
+    const audioReactiveTick = () => {
+      const active = listeningRef.current || orbStateRef.current === 'speaking';
+      if (!active) {
+        // Nothing to animate: stop the rAF loop entirely and only poll at a
+        // low rate until listening/speaking resumes.
+        raf = undefined;
+        idleTimer = setInterval(() => {
+          if (listeningRef.current || orbStateRef.current === 'speaking') {
+            if (idleTimer) clearInterval(idleTimer);
+            idleTimer = undefined;
+            raf = requestAnimationFrame(audioReactiveTick);
+          }
+        }, 250);
+        return;
+      }
+      const now = performance.now();
+      // Throttle audio-reactive level updates to ~20 Hz so the renderer is not
+      // re-rendered every animation frame while the assistant is active.
+      if (now - last > 50 && analysers.current[0]) {
+        last = now;
         const data = new Uint8Array(analysers.current[0].frequencyBinCount);
         analysers.current[0].getByteFrequencyData(data);
         let sum = 0;
         for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-        const r = Math.sqrt(sum / data.length) / 255;
-        setRms(r);
+        setRms(Math.sqrt(sum / data.length) / 255);
       }
-      raf = requestAnimationFrame(updateRms);
+      raf = requestAnimationFrame(audioReactiveTick);
     };
-    raf = requestAnimationFrame(updateRms);
-    return () => cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(audioReactiveTick);
+    return () => {
+      if (raf !== undefined) cancelAnimationFrame(raf);
+      if (idleTimer !== undefined) clearInterval(idleTimer);
+    };
   }, []);
 
   const listeningRef = useRef(isListening);
@@ -700,6 +900,75 @@ function App() {
   const toggleCooldownRef = useRef(0);
   listeningRef.current = isListening;
   processingRef.current = isProcessing;
+
+  const sendPrompt = useCallback(
+    async (raw: string) => {
+      const prompt = raw.trim();
+      if (!prompt || isTextSubmitting || isProcessing) return;
+      lastPromptRef.current = prompt;
+      lastUserPushedRef.current = prompt;
+      lastRealTranscriptRef.current = '';
+      setTypedPrompt('');
+      setLiveTranscript('');
+      setAssistantText('');
+      setError(null);
+      pushConversation('user', prompt);
+      setIsTextSubmitting(true);
+      setIsProcessing(true);
+      setOrbState('thinking');
+      try {
+        const token = await getSessionToken();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['X-Jarvis-Token'] = token;
+        const session_id = localStorage.getItem('jarvis_chat_session') || undefined;
+        // Bound the request so the UI can never hang in "thinking" forever if
+        // the backend (or its LLM) stalls.  Desktop commands return in ~1s via
+        // deterministic routing; a normal LLM-only query stays well under this.
+        const response = await withTimeout(
+          fetch('/api/chat', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ message: prompt, session_id }),
+          }),
+          60000,
+          'JARVIS took too long to respond. Please try again.',
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.detail || 'JARVIS could not answer right now.');
+        if (payload.session_id) localStorage.setItem('jarvis_chat_session', payload.session_id);
+        const reply = String(payload.text || 'I could not generate an answer.');
+        const verifiedNotes = summarizeVerifiedTools(payload.tool_results, reply);
+        const display = verifiedNotes.length ? `${reply}\n\n${verifiedNotes.join('\n')}` : reply;
+        setAssistantText(display);
+        pushConversation('assistant', display);
+        // The typed path produces text only (no TTS audio), so never mark the
+        // orb as speaking here. Drop to idle unless audio is still playing.
+        if (audioQueueRef.current.length === 0 && !isPlayingAudioRef.current) {
+          setOrbState('idle');
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'JARVIS could not answer right now.');
+        setOrbState('idle');
+      } finally {
+        setIsTextSubmitting(false);
+        setIsProcessing(false);
+      }
+    },
+    [isTextSubmitting, isProcessing, pushConversation, getSessionToken],
+  );
+
+  const submitTypedPrompt = useCallback(
+    (event: React.FormEvent) => {
+      event.preventDefault();
+      void sendPrompt(typedPrompt);
+    },
+    [typedPrompt, sendPrompt],
+  );
+
+  const retryLastPrompt = useCallback(() => {
+    if (!lastPromptRef.current) return;
+    void sendPrompt(lastPromptRef.current);
+  }, [sendPrompt]);
 
   const toggleTalk = useCallback(async () => {
     console.log(
@@ -730,6 +999,7 @@ function App() {
         return;
       }
       console.log('[voice] starting listening');
+      stopPlayback();
       socket.send(JSON.stringify({ type: 'start_listening', mode: 'ptt' }));
       nativeListeningRef.current = true;
       setIsListening(true);
@@ -742,7 +1012,7 @@ function App() {
       return;
     }
     await beginVoiceSessionRef.current();
-  }, []);
+  }, [stopPlayback]);
 
   const sendAudioStart = () => {
     const socket = ws.current;
@@ -925,6 +1195,7 @@ function App() {
 
   const beginVoiceSession = async () => {
     if (processingRef.current || listeningRef.current || micBusyRef.current) return;
+    stopPlayback();
     if (settingsRef.current.voiceMode === 'native') {
       const socket = ws.current;
       if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -1085,50 +1356,138 @@ function App() {
     };
   }, [quickActionsOpen, closeQuickActions]);
 
-  const playNextAudio = useCallback(() => {
+  // Web Audio playback. HTMLMediaElement (`new Audio`) fails to load ANY audio
+  // resource in this Electron window (MEDIA_ERR_SRC_NOT_SUPPORTED) while the
+  // Web Audio stack decodes and plays WAV/MP3 reliably, so playback routes
+  // through AudioContext. The single queue/guard is unchanged.
+  const playNextAudio = useCallback(async () => {
     if (isPlayingAudioRef.current) return;
+    const ctx = audioContext.current;
+    if (!ctx) {
+      setError('Voice unavailable');
+      return;
+    }
     const next = audioQueueRef.current.shift();
     if (!next) {
       setOrbState('idle');
       return;
     }
-    isPlayingAudioRef.current = true;
     try {
-      const audioData = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
-      const isWav =
-        audioData.byteLength > 4 &&
-        String.fromCharCode(audioData[0], audioData[1], audioData[2], audioData[3]) === 'RIFF';
-      const blob = new Blob([audioData], { type: isWav ? 'audio/wav' : 'audio/mpeg' });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.volume = settings.volume;
-      audio.playbackRate = settings.speed;
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch {
+          /* resume can reject when there is no output device */
+        }
+      }
+      if (ctx.state !== 'running') {
+        setError('Voice unavailable (no audio output device).');
         playNextAudio();
-      };
-      audio.onerror = () => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
-        playNextAudio();
-      };
-      audio.play().catch(() => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
-        playNextAudio();
+        return;
+      }
+      let bytes = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
+      let buffer: AudioBuffer | null = null;
+      try {
+        buffer = await ctx.decodeAudioData(bytes.buffer);
+      } catch (decodeErr) {
+        // The backend emits exactly one complete file per segment, but if a
+        // concatenated RIFF/WAV blob slips through (older backend, third-party
+        // client), split on RIFF headers and decode the first complete file
+        // instead of feeding incompatible audio to the decoder.
+        bytes = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
+        const riffOffsets: number[] = [];
+        for (let i = 0; i + 4 <= bytes.length; i += 1) {
+          if (
+            bytes[i] === 0x52 &&
+            bytes[i + 1] === 0x49 &&
+            bytes[i + 2] === 0x46 &&
+            bytes[i + 3] === 0x46
+          ) {
+            riffOffsets.push(i);
+          }
+        }
+        for (let i = 0; i < riffOffsets.length && !buffer; i += 1) {
+          try {
+            buffer = await ctx.decodeAudioData(bytes.buffer.slice(riffOffsets[i]));
+          } catch {
+            /* try the next complete file */
+          }
+        }
+        if (!buffer) throw decodeErr;
+      }
+      if (!buffer || buffer.length === 0 || buffer.duration <= 0) {
+        throw new Error('empty audio buffer');
+      }
+      isPlayingAudioRef.current = true;
+      setOrbState('speaking');
+      logVoice('speaking', {
+        level: 'debug',
+        bytes: bytes.byteLength,
+        duration_s: Math.round(buffer.duration * 1000) / 1000,
+        sample_rate: buffer.sampleRate,
+        channels: buffer.numberOfChannels,
       });
-    } catch {
-      setError('Failed to play audio');
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.playbackRate.value = Math.max(settings.speed, 0.1);
+      const gain = ctx.createGain();
+      gain.gain.value = settings.volume;
+      source.connect(gain);
+      gain.connect(ctx.destination);
+      playbackSourceRef.current = source;
+      const startedAt = Date.now();
+      source.onended = () => {
+        if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+        if (playbackSourceRef.current === source) playbackSourceRef.current = null;
+        if (isPlayingAudioRef.current) {
+          logVoice('speaking_end', {
+            level: 'debug',
+            played_ms: Date.now() - startedAt,
+          });
+        }
+        isPlayingAudioRef.current = false;
+        playNextAudio();
+      };
+      const expectedMs = (buffer.duration / Math.max(settings.speed, 0.1)) * 1000;
+      playbackTimerRef.current = setTimeout(() => {
+        // Watchdog: if `onended` never fired (node GC'd / interrupted), release
+        // the pipeline so the queue can never stall waiting for an end event.
+        if (isPlayingAudioRef.current && playbackSourceRef.current === source) {
+          logVoice('error', {
+            level: 'warn',
+            stage: 'audio_context',
+            code: 'playback_end_timeout',
+            message: 'playback end event never fired; releasing queue',
+          });
+          try {
+            source.stop();
+          } catch {
+            /* already stopped */
+          }
+          playbackSourceRef.current = null;
+          isPlayingAudioRef.current = false;
+          playNextAudio();
+        }
+      }, expectedMs + 1500);
+      source.start();
+    } catch (err) {
       isPlayingAudioRef.current = false;
+      if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+      logVoice('error', {
+        level: 'error',
+        stage: 'audio_context',
+        code: (err as Error)?.name || 'decode_failed',
+        message: (err as Error)?.message || 'Failed to decode or play audio',
+      });
+      setError("I couldn't play the response.");
       playNextAudio();
     }
-  }, [settings.volume, settings.speed]);
+  }, [settings.volume, settings.speed, logVoice]);
 
   const enqueueAudio = useCallback(
     (audioBase64: string) => {
       audioQueueRef.current.push(audioBase64);
-      playNextAudio();
+      void playNextAudio();
     },
     [playNextAudio],
   );
@@ -1146,71 +1505,26 @@ function App() {
   };
   startProcessingWatchdogRef.current = startProcessingWatchdog;
 
-  const handleOrbDragMove = useCallback(
-    (dx: number, dy: number) => {
-      if (!dragStartPosRef.current) {
-        dragStartPosRef.current = {
-          x: orbPositionRef.current.x - dx,
-          y: orbPositionRef.current.y - dy,
-        };
-        // Grow the window while dragging so a fast flick cannot leave the
-        // cursor outside the (otherwise tiny) window and drop the mousemove
-        // stream. The orb stays centered under the cursor the whole time.
-        if (isElectron) {
-          setWindowMode('menu');
-          getElectronAPI()?.setWindowMode?.(
-            'menu',
-            orbPositionRef.current.x,
-            orbPositionRef.current.y,
-          );
-        }
-      }
-      const start = dragStartPosRef.current;
-      const next = { x: Math.round(start.x + dx), y: Math.round(start.y + dy) };
-      if (isElectron) {
-        const applied = getElectronAPI()?.setOrbPosition?.(next.x, next.y);
-        if (applied && typeof applied.then === 'function') {
-          applied.then((pos: { x: number; y: number } | null) => {
-            if (pos && typeof pos.x === 'number') setOrbPosition(pos);
-          });
-        }
-      } else {
-        setOrbPosition(next);
-      }
-    },
-    [isElectron],
-  );
+  // Native Electron dragging. The outer `.bubble-container` is a
+  // `-webkit-app-region: drag` region, so the OS/compositor moves the window
+  // directly — no JS drag loop and no per-frame setPosition. The main process
+  // reports drag state so nonessential CSS animations pause while moving.
+  useEffect(() => {
+    const api = getElectronAPI();
+    const unsub = api?.onWindowDragState?.(setWindowDragging);
+    return () => unsub?.();
+  }, []);
 
-  const handleOrbDragEnd = useCallback(() => {
-    dragStartPosRef.current = null;
-    localStorage.setItem(ORB_POSITION_KEY, JSON.stringify(orbPositionRef.current));
-    if (isElectron) {
-      setWindowMode('orb');
-      getElectronAPI()?.setWindowMode?.('orb', orbPositionRef.current.x, orbPositionRef.current.y);
-    }
-  }, [isElectron]);
+  // The visible bubble is a `-webkit-app-region: no-drag` click target. A
+  // native drag can only ever start on the surrounding drag region, so a click
+  // reaching this handler is always a genuine click (never a drag).
+  const handleOrbBubbleClick = useCallback(() => {
+    openPanel();
+  }, [openPanel]);
 
   const handleOrbContextMenu = useCallback(() => {
     getElectronAPI()?.showContextMenu?.();
   }, []);
-
-  const handleQuickAction = useCallback(
-    (action: 'talk' | 'chat' | 'settings') => {
-      setQuickActionsOpen(false);
-      if (action === 'talk') {
-        if (isElectron)
-          getElectronAPI()?.setWindowMode?.(
-            'orb',
-            orbPositionRef.current.x,
-            orbPositionRef.current.y,
-          );
-        toggleTalk();
-      } else {
-        openPanel(action);
-      }
-    },
-    [toggleTalk, openPanel, isElectron],
-  );
 
   const handlePanelToggleTalk = useCallback(() => {
     if (isProcessing) return;
@@ -1226,19 +1540,34 @@ function App() {
   }, [_voiceMachineState]);
 
   useEffect(() => {
+    let pushToTalkActive = false;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.repeat) return;
       if (e.ctrlKey && e.code === 'Space') {
         e.preventDefault();
-        if (!isElectron) toggleTalk();
+        if (!isElectron && !pushToTalkActive) {
+          pushToTalkActive = true;
+          toggleTalk();
+        }
         return;
       }
       if (e.key === 'Escape' && panelOpen) {
         handlePanelClose();
       }
     };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (pushToTalkActive && (e.code === 'Space' || e.key === 'Control')) {
+        e.preventDefault();
+        pushToTalkActive = false;
+        if (!isElectron && listeningRef.current) toggleTalk();
+      }
+    };
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
   }, [toggleTalk, panelOpen, handlePanelClose, isElectron]);
 
   const effectiveOrbState: OrbState = panelOpen && orbState === 'idle' ? 'panel-open' : orbState;
@@ -1251,16 +1580,11 @@ function App() {
           left: PANEL_ANCHOR.x,
           top: PANEL_ANCHOR.y,
           transform: 'translate(-50%, -50%)',
-          display: 'none',
         };
       }
-      const anchor = windowMode === 'menu' ? MENU_WINDOW / 2 : ORB_WINDOW / 2;
-      return {
-        position: 'absolute' as const,
-        left: anchor,
-        top: anchor,
-        transform: 'translate(-50%, -50%)',
-      };
+      // Orb mode: the bubble container fills the 72×72 window exactly and the
+      // orb is flex-centered — no transforms on the drag surface.
+      return { position: 'absolute' as const, inset: 0 };
     }
     return {
       position: 'absolute' as const,
@@ -1270,13 +1594,36 @@ function App() {
     };
   }, [isElectron, windowMode, orbPosition]);
 
+  useEffect(() => {
+    conversationEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+  }, [conversation, liveTranscript, assistantText, isProcessing, error]);
+
   const showTransientHud = !isElectron || windowMode === 'panel';
+  const showMainUi = !isElectron || windowMode === 'panel';
+
+  const headerStatus = isProcessing
+    ? { label: 'Thinking…', cls: 'is-processing' }
+    : isListening
+      ? { label: isEndpointing ? 'Finishing up…' : 'Listening…', cls: 'is-listening' }
+      : orbState === 'speaking'
+        ? { label: 'Speaking…', cls: 'is-speaking' }
+        : { label: 'JARVIS ready', cls: '' };
+
+  const lastConversation = conversation[conversation.length - 1];
+  const livePlaceholders = ['Listening...', 'Recording...', 'Transcribing...'];
+  const liveUserShown =
+    !!liveTranscript &&
+    !livePlaceholders.includes(liveTranscript.trim()) &&
+    !(lastConversation?.role === 'user' && lastConversation.text === liveTranscript.trim());
+  const liveAssistantShown =
+    !!assistantText &&
+    !(lastConversation?.role === 'assistant' && lastConversation.text === assistantText.trim());
 
   return (
     <ToastProvider>
       <ErrorBoundary>
         <div
-          className={`app ${isElectron ? 'app-electron' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''} ${isElectron && windowMode === 'orb' ? 'orb-mode' : ''}`}
+          className={`app ${isElectron ? 'app-electron' : ''} ${showMainUi ? 'main-ui' : ''} ${windowMode === 'panel' ? 'panel-mode' : ''} ${isElectron && windowMode === 'orb' ? 'orb-mode' : ''}`}
           role="main"
           aria-label="JARVIS Voice Assistant"
         >
@@ -1296,65 +1643,181 @@ function App() {
               </div>
             </div>
           )}
+          {showMainUi && (
+            <header className="main-header">
+              <div className="main-header-orb">
+                <MinimalBubble
+                  state={effectiveOrbState}
+                  audioLevel={rms}
+                  onToggle={handlePanelClose}
+                />
+              </div>
+              <span className={`main-header-dot ${headerStatus.cls}`} aria-hidden="true" />
+              <span className="main-header-status" aria-live="polite">
+                {headerStatus.label}
+              </span>
+              {isElectron && (
+                <button
+                  type="button"
+                  className="main-header-collapse"
+                  onClick={handlePanelClose}
+                  aria-label="Minimize JARVIS to orb mode"
+                  title="Minimize to orb"
+                >
+                  —
+                </button>
+              )}
+            </header>
+          )}
           <main className="app-main">
-            <div
-              className={`orb-anchor ${isListening ? 'recording' : ''} ${windowMode === 'panel' ? 'orb-anchor-hidden' : ''}`}
-              style={orbAnchorStyle as React.CSSProperties}
-            >
-              <OrbEngine
-                state={effectiveOrbState}
-                rms={rms}
-                onToggleTalk={toggleTalk}
-                onExpandPanel={() => openPanel()}
-                onSingleClick={openPanel}
-                onQuickAction={handleQuickAction}
-                onClick={handlePanelClose}
-                onDragMove={handleOrbDragMove}
-                onDragEnd={handleOrbDragEnd}
-                onContextMenu={handleOrbContextMenu}
-                quickActionsOpen={quickActionsOpen}
-                onCloseQuickActions={closeQuickActions}
-              />
+            <div className={`bubble-container ${windowDragging ? 'bubble-dragging' : ''}`}>
+              <div
+                className={`orb-anchor ${isListening ? 'recording' : ''} ${windowMode === 'panel' ? 'orb-anchor-hidden' : ''}`}
+                style={orbAnchorStyle as React.CSSProperties}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  handleOrbContextMenu();
+                }}
+              >
+                <MinimalBubble
+                  state={effectiveOrbState}
+                  audioLevel={rms}
+                  onToggle={handleOrbBubbleClick}
+                />
+              </div>
             </div>
 
-            {showTransientHud && (
-              <div className="orb-hint" aria-live="polite">
-                {isProcessing
-                  ? 'Thinking...'
-                  : isListening
-                    ? isEndpointing
-                      ? 'Finishing...'
-                      : 'Tap to stop'
-                    : 'Tap to talk'}
-              </div>
+            {showMainUi && (
+              <section className="conversation" aria-label="Conversation" aria-live="polite">
+                <div className="conversation-inner">
+                  {conversation.length === 0 &&
+                    !liveTranscript &&
+                    !assistantText &&
+                    !isProcessing &&
+                    !error && (
+                      <div className="conversation-empty">
+                        Ask JARVIS anything, or press Ctrl+Space to talk.
+                      </div>
+                    )}
+                  {conversation.map((message, i) => (
+                    <div key={i} className={`conversation-message ${message.role}`}>
+                      <span className="conversation-message-role">
+                        {message.role === 'user' ? 'You' : 'JARVIS'}
+                      </span>
+                      <div className="conversation-message-text">{message.text}</div>
+                    </div>
+                  ))}
+                  {liveUserShown && (
+                    <div className="conversation-message user">
+                      <span className="conversation-message-role">You</span>
+                      <div className="conversation-message-text">{liveTranscript}</div>
+                    </div>
+                  )}
+                  {liveAssistantShown && (
+                    <div className="conversation-message assistant">
+                      <span className="conversation-message-role">JARVIS</span>
+                      <div className="conversation-message-text">{assistantText}</div>
+                    </div>
+                  )}
+                  {isProcessing && !assistantText && (
+                    <div className={`conversation-status ${isListening ? 'listening' : ''}`}>
+                      {isListening ? 'Listening…' : 'JARVIS is thinking…'}
+                    </div>
+                  )}
+                  {isListening && !liveTranscript && !isProcessing && (
+                    <div className="conversation-status listening">Listening…</div>
+                  )}
+                  {error && (
+                    <div className="conversation-error" role="alert" aria-live="assertive">
+                      <span className="conversation-error-title">Something went wrong</span>
+                      <div className="conversation-error-text">{error}</div>
+                      <button
+                        type="button"
+                        onClick={retryLastPrompt}
+                        disabled={isTextSubmitting || isProcessing}
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                  <div ref={conversationEndRef} />
+                </div>
+              </section>
             )}
 
-            {showTransientHud && isListening && liveTranscript && (
-              <div className="orb-caption" aria-live="polite">
-                {liveTranscript}
-              </div>
+            {!showMainUi && (
+              <Panel
+                open={panelOpen}
+                view={panelView}
+                onViewChange={handlePanelViewChange}
+                onClose={handlePanelClose}
+                orbPosition={orbPosition}
+                onToggleTalk={handlePanelToggleTalk}
+                settings={settings}
+                onSaveSettings={(next) => {
+                  setSettings(next);
+                  try {
+                    localStorage.setItem('voiceSettings', JSON.stringify(next));
+                    window.dispatchEvent(new CustomEvent('jarvis-settings-change'));
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+                fillWindow={isElectron}
+              />
             )}
-
-            <Panel
-              open={panelOpen}
-              view={panelView}
-              onViewChange={handlePanelViewChange}
-              onClose={handlePanelClose}
-              orbPosition={orbPosition}
-              onToggleTalk={handlePanelToggleTalk}
-              settings={settings}
-              onSaveSettings={(next) => {
-                setSettings(next);
-                try {
-                  localStorage.setItem('voiceSettings', JSON.stringify(next));
-                  window.dispatchEvent(new CustomEvent('jarvis-settings-change'));
-                } catch {
-                  /* ignore */
-                }
-              }}
-              fillWindow={isElectron}
-            />
           </main>
+
+          {showMainUi && (
+            <footer className="composer">
+              {micNotice && (
+                <div className="mic-notice" role="status" aria-live="polite">
+                  {micNotice}
+                </div>
+              )}
+              <button
+                type="button"
+                className={`composer-mic ${isListening ? 'is-listening' : ''}`}
+                onClick={toggleTalk}
+                disabled={isProcessing}
+                aria-label={isListening ? 'Stop listening' : 'Start listening'}
+                title={isListening ? 'Stop listening' : 'Start listening (Ctrl+Space)'}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="9" y="2" width="6" height="12" rx="3" />
+                  <path d="M5 10v1a7 7 0 0 0 14 0v-1" />
+                  <line x1="12" y1="18" x2="12" y2="22" />
+                  <line x1="8" y1="22" x2="16" y2="22" />
+                </svg>
+              </button>
+              <form className="composer-form" onSubmit={submitTypedPrompt}>
+                <input
+                  value={typedPrompt}
+                  onChange={(event) => setTypedPrompt(event.target.value)}
+                  placeholder="Ask JARVIS anything…"
+                  aria-label="Ask JARVIS anything"
+                  disabled={isTextSubmitting || isProcessing}
+                />
+                <button
+                  type="submit"
+                  aria-label="Send message"
+                  disabled={!typedPrompt.trim() || isTextSubmitting || isProcessing}
+                >
+                  ↵
+                </button>
+              </form>
+            </footer>
+          )}
 
           {showTransientHud && activeConfirmation && (
             <div className="confirmation-dialog" role="dialog" aria-live="assertive">

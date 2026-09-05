@@ -3,6 +3,7 @@ import base64
 import io
 import os
 import secrets
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,12 +21,13 @@ from routes.state import (
     require_session_token,
     system_manager,
 )
+from tools import app_tools
 
 TERMINAL_ALLOWLIST = {
     "ls", "pwd", "whoami", "uname", "date", "uptime", "df", "du", "free",
     "ps", "top", "stat", "echo", "cat", "head", "tail", "grep", "find",
-    "wc", "tree", "env", "id", "hostname", "who", "which", "locale",
-    "sysctl", "nproc", "printenv", "history",
+    "wc", "tree", "id", "hostname", "who", "which", "locale",
+    "sysctl", "nproc",
 }
 for _extra in (os.getenv("TERMINAL_ALLOWLIST_EXTRA", "") or "").split(","):
     if _extra.strip():
@@ -35,49 +37,8 @@ TERMINAL_EXEC_TIMEOUT = float(os.getenv("TERMINAL_EXEC_TIMEOUT", "60"))
 TERMINAL_OUTPUT_CAP = 1_048_576  # bytes of accumulated output kept per task
 _TERMINAL_METACHARS = set(";&|<>`$()\n\r")
 
-ALLOWED_APPS = {
-    "firefox",
-    "chrome",
-    "chromium",
-    "chromium-browser",
-    "thunderbird",
-    "evolution",
-    "nautilus",
-    "dolphin",
-    "code",
-    "code-oss",
-    "vim",
-    "nvim",
-    "nano",
-    "gedit",
-    "terminal",
-    "konsole",
-    "alacritty",
-    "kitty",
-    "tilix",
-    "libreoffice",
-    "libreoffice-writer",
-    "libreoffice-calc",
-    "vlc",
-    "audacious",
-    "rhythmbox",
-    "spotify",
-    "gnome-settings",
-    "systemsettings",
-    "blender",
-    "gimp",
-    "inkscape",
-    "file-roller",
-    "evince",
-    "okular",
-    "gnome-calculator",
-    "xfce4-terminal",
-    "xterm",
-    "wezterm",
-    "sublime_text",
-    "atom",
-    "figma",
-}
+# Single source of truth for launchable apps lives in tools/app_tools.py.
+ALLOWED_APPS = app_tools.ALLOWED_APPS
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
 
@@ -168,6 +129,21 @@ def _validate_terminal_command(command: str) -> str:
             status_code=403,
             detail=f"Command '{first}' is not in the allowed terminal list. Allowed: {allowed}",
         )
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid command arguments: {exc}") from exc
+    if not parts or parts[0].rsplit("/", 1)[-1] not in TERMINAL_ALLOWLIST:
+        raise HTTPException(status_code=403, detail="Command is not allowed")
+    if parts[0].rsplit("/", 1)[-1] in {"cat", "head", "tail", "grep", "stat"}:
+        for arg in parts[1:]:
+            if arg.startswith("-"):
+                continue
+            candidate = Path(arg).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(ALLOWED_FILE_BASE) / candidate
+            if is_sensitive_path(candidate):
+                raise HTTPException(status_code=403, detail="Refusing to read a sensitive path")
     return cmd
 
 
@@ -353,8 +329,8 @@ async def terminal_execute(request: Request):
 
     async def _run():
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *shlex.split(command),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 preexec_fn=os.setsid if hasattr(os, "setsid") else None,

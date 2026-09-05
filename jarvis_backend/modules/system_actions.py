@@ -6,6 +6,8 @@ import subprocess
 
 import psutil
 
+from tools.app_tools import resolve_launch_target
+
 logger = logging.getLogger(__name__)
 
 SHELL_METACHARACTERS = re.compile(r"[;&|><`$()]")
@@ -190,7 +192,7 @@ class SystemActions:
             return []
 
     async def open_application(self, app_name: str) -> bool:
-        """Open an application (whitelist-validated)"""
+        """Open an application (allowlist-validated)"""
 
         try:
             if SHELL_METACHARACTERS.search(app_name):
@@ -199,45 +201,10 @@ class SystemActions:
                 return False
             if "/" in app_name or "\\" in app_name:
                 return False
-            allowed_apps = {
-                "firefox",
-                "chrome",
-                "chromium",
-                "chromium-browser",
-                "thunderbird",
-                "evolution",
-                "nautilus",
-                "dolphin",
-                "code",
-                "code-oss",
-                "vim",
-                "nvim",
-                "nano",
-                "gedit",
-                "terminal",
-                "konsole",
-                "alacritty",
-                "kitty",
-                "tilix",
-                "libreoffice",
-                "libreoffice-writer",
-                "libreoffice-calc",
-                "vlc",
-                "audacious",
-                "rhythmbox",
-                "spotify",
-                "gnome-settings",
-                "systemsettings",
-                "blender",
-                "gimp",
-                "inkscape",
-                "file-roller",
-                "evince",
-                "okular",
-            }
-            if app_name not in allowed_apps:
+            executable = resolve_launch_target(app_name)
+            if not executable:
                 return False
-            subprocess.Popen([app_name])
+            subprocess.Popen([executable])
             logger.info(f"Opening application: {app_name}")
             return True
         except Exception as e:

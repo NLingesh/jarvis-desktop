@@ -4,11 +4,14 @@ Creating the module-level singletons here avoids each route file
 instantiating its own copy of MemoryManager, LLMProvider, etc.
 """
 
+import base64
 import contextlib
 import logging
 import os
 import re
 import secrets
+import time
+import uuid
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -39,6 +42,7 @@ from modules.capability import CapabilityPolicy
 from modules.documents_module import DocumentsModule
 from modules.llm_provider import LLMProvider
 from modules.mail_module import MailModule, MailSessionStore
+from modules.memory_safety import is_sensitive_memory  # noqa: F401 (re-exported for tools)
 from modules.notes_module import NotesModule
 from modules.orchestrator import Orchestrator, strip_markdown_for_speech
 from modules.session_context import SessionContextStore
@@ -56,8 +60,14 @@ from modules.web_browse import WebBrowseModule
 from plugins.permissions import PermissionManager
 from plugins.registry import PluginRegistry
 from tools import ToolRegistry
-from tools.app_tools import LaunchAppTool, OpenTerminalTool
-from tools.desktop_tools import CloseAppTool, ScreenshotTool
+from tools.app_tools import ControlAppWindowTool, LaunchApplicationTool, OpenTerminalTool
+from tools.desktop_tools import (
+    CloseAppTool,
+    ListRunningApplicationsTool,
+    OpenUrlTool,
+    ResolveKnownLocationTool,
+    ScreenshotTool,
+)
 from tools.document_tools import ReadDocumentTool
 from tools.file_tools import (
     CopyFileTool,
@@ -74,7 +84,14 @@ from tools.file_tools import (
     OpenFolderTool,
     ReadFileTool,
 )
-from tools.memory_tools import ForgetMemoryTool, RecallMemoryTool, RememberMemoryTool
+from tools.memory_tools import (
+    ClearAllMemoriesTool,
+    ForgetMemoryTool,
+    GetCurrentContextTool,
+    RecallMemoryTool,
+    RememberMemoryTool,
+    UpdateMemoryTool,
+)
 from tools.shell_tools import ExecuteShellTool
 from tools.system_tools import RunningProcessesTool, SystemInfoTool
 from tools.web_tools import WebSearchTool
@@ -297,10 +314,14 @@ permission_manager = PermissionManager()
 tool_registry = ToolRegistry()
 tool_registry.register(SystemInfoTool())
 tool_registry.register(RunningProcessesTool())
-tool_registry.register(LaunchAppTool())
+tool_registry.register(LaunchApplicationTool())
 tool_registry.register(OpenTerminalTool())
+tool_registry.register(ControlAppWindowTool())
 tool_registry.register(CloseAppTool())
 tool_registry.register(ScreenshotTool())
+tool_registry.register(OpenUrlTool())
+tool_registry.register(ResolveKnownLocationTool())
+tool_registry.register(ListRunningApplicationsTool())
 tool_registry.register(FileSearchTool())
 tool_registry.register(ListDirectoryTool())
 tool_registry.register(ReadFileTool())
@@ -312,6 +333,9 @@ tool_registry.register(ReadDocumentTool())
 tool_registry.register(RememberMemoryTool())
 tool_registry.register(RecallMemoryTool())
 tool_registry.register(ForgetMemoryTool())
+tool_registry.register(UpdateMemoryTool())
+tool_registry.register(ClearAllMemoriesTool())
+tool_registry.register(GetCurrentContextTool())
 tool_registry.register(FindRecentFilesTool())
 tool_registry.register(FindByExtensionTool())
 tool_registry.register(IdentifyFileTypeTool())
@@ -626,34 +650,11 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
 
     user_lower = user_input.lower()
 
-    # --- Profile / preferences commands --------------------------------------
-    remember_match = re.match(
-        r"(?:remember|note down|don't forget|please remember)\s+(?:that\s+)?(.*)",
-        user_input,
-        re.IGNORECASE,
-    )
-    if remember_match and remember_match.group(1).strip():
-        fact = remember_match.group(1).strip().strip(".")
-        note = await ensure_profile_note()
-        if note:
-            existing = (note.get("body") or "").rstrip()
-            line = f"- {fact}"
-            if line not in existing:
-                new_body = f"{existing}\n{line}" if existing.strip() else f"## About\n{line}"
-                with contextlib.suppress(Exception):
-                    await vault.update_note(resolve_profile_note_path(), content=new_body)
-        context["profile"] = {"action": "remembered", "fact": fact}
-        return context
-
-    if re.search(r"forget (?:my )?(?:preferences|profile|about me)", user_lower) or user_lower in (
-        "forget me",
-        "reset profile",
-        "clear my profile",
-    ):
-        await reset_profile_note()
-        context["profile"] = {"action": "forgotten"}
-        return context
-
+    # --- Profile reads only -----------------------------------------------------
+    # Memory WRITES and destructive resets are owned exclusively by the typed
+    # tool pipeline (remember_memory / clear_all_memories) so that secret
+    # filtering, deduplication, retention, and single-use approval always
+    # apply.  This legacy context builder must never persist directly.
     if "know about me" in user_lower or ("about me" in user_lower and "know" in user_lower):
         note = await get_profile_note()
         context["profile"] = {
@@ -747,35 +748,133 @@ async def process_command(user_input: str, session_id: str | None = None) -> dic
     return context
 
 
+def _safe_audio_meta(chunk_b64: str) -> dict:
+    """Safe metadata for a TTS audio chunk.
+
+    Returns format/sample-rate/channel metadata only. Never logs raw audio,
+    transcripts, or tokens. Non-WAV payloads are reported as ``mp3-like``
+    (MP3/ADTS/M4A) because the exact codec is not sniffed here.
+    """
+    try:
+        data = base64.b64decode(chunk_b64)
+    except Exception:
+        return {}
+    if len(data) < 12 or data[:4] != b"RIFF":
+        return {"format": "mp3-like"}
+    import struct
+
+    with contextlib.suppress(Exception):
+        channels = struct.unpack_from("<H", data, 22)[0]
+        sample_rate = struct.unpack_from("<I", data, 24)[0]
+        bits = struct.unpack_from("<H", data, 34)[0]
+        data_size = struct.unpack_from("<I", data, 40)[0] if len(data) >= 44 else 0
+        duration = 0.0
+        byte_rate = max(channels * (bits // 8), 1)
+        if sample_rate and byte_rate:
+            duration = data_size / (sample_rate * byte_rate)
+        return {
+            "format": "wav",
+            "channels": channels,
+            "sample_rate": sample_rate,
+            "bits_per_sample": bits,
+            "pcm_bytes": data_size,
+            "duration_s": round(duration, 3),
+        }
+    return {"format": "wav"}
+
+
 async def _stream_sentence_audio(websocket, sentence: str, voice_uid: str) -> None:
     """Stream TTS audio for one sentence using the standard segment flow.
 
     Sends ``audio_segment_start`` → ``audio_chunk``* → ``audio_segment_end``.
     If the TTS pipeline produces no audio, sends an ``error`` message so the
     frontend can transition out of the speaking state instead of hanging.
+
+    Every emitted segment contains exactly one complete, decodable audio file:
+    providers that yield whole files per chunk (Kokoro WAV) emit one segment
+    per chunk, while stream providers that yield fragments of a single file
+    (edge-tts MP3) are joined into one segment.  This keeps concatenated
+    RIFF/WAV blobs out of the renderer's decoder.
+
+    Logs safe diagnostics only: TTS start/end, chunk/byte counts, format,
+    sample rate, channel count, duration, and error category.
     """
-    await websocket.send_json({"type": "audio_segment_start"})
     chunks = 0
+    total_bytes = 0
+    first_chunk = ""
+    segments = 0
+    pending: list[str] = []
+    started = time.monotonic()
+    logger.info("[voice:%s] tts start chars=%d", voice_uid, len(sentence))
+
+    async def _send(message: dict) -> None:
+        await websocket.send_json(message)
+
     try:
         async for audio_chunk in tts.stream_speech(sentence):
             chunks += 1
-            await websocket.send_json({"type": "audio_chunk", "chunk": audio_chunk})
+            if not first_chunk:
+                first_chunk = audio_chunk
+            try:
+                raw = base64.b64decode(audio_chunk)
+            except Exception as e:
+                logger.warning("[voice:%s] invalid TTS chunk dropped: %s", voice_uid, e)
+                continue
+            total_bytes += len(raw)
+            if raw.startswith(b"RIFF"):
+                # Whole-file chunk (e.g. Kokoro WAV): emit as its own segment so
+                # the frontend never has to decode concatenated RIFF blobs.
+                if segments > 0:
+                    await _send({"type": "audio_segment_end"})
+                await _send({"type": "audio_segment_start"})
+                await _send({"type": "audio_chunk", "chunk": audio_chunk})
+                segments += 1
+            else:
+                # Fragment of a single streamed file (e.g. edge-tts MP3):
+                # accumulate and flush as one segment.
+                pending.append(audio_chunk)
     except Exception as e:
         logger.error("[voice:%s] TTS streaming failed for sentence: %s", voice_uid, e)
-
-    if chunks == 0:
-        logger.warning(
-            "[voice:%s] TTS produced no audio — sending error so UI recovers",
-            voice_uid,
-        )
         with contextlib.suppress(Exception):
-            await websocket.send_json(
+            await _send(
                 {
                     "type": "error",
                     "message": "Speech generation failed. Check your TTS configuration.",
                 }
             )
-    await websocket.send_json({"type": "audio_segment_end"})
+
+    if pending:
+        if segments > 0:
+            await _send({"type": "audio_segment_end"})
+        await _send({"type": "audio_segment_start"})
+        await _send({"type": "audio_chunk", "chunk": "".join(pending)})
+        segments += 1
+
+    took_ms = (time.monotonic() - started) * 1000
+    if segments == 0:
+        logger.warning(
+            "[voice:%s] TTS produced no audio — sending error so UI recovers",
+            voice_uid,
+        )
+        with contextlib.suppress(Exception):
+            await _send(
+                {
+                    "type": "error",
+                    "message": "Speech generation failed. Check your TTS configuration.",
+                }
+            )
+    else:
+        meta = _safe_audio_meta(first_chunk)
+        logger.info(
+            "[voice:%s] tts end chunks=%d segments=%d bytes=%d %s took=%.0fms",
+            voice_uid,
+            chunks,
+            segments,
+            total_bytes,
+            " ".join(f"{k}={v}" for k, v in meta.items()),
+            took_ms,
+        )
+    await _send({"type": "audio_segment_end"})
 
 
 async def stream_speech_to_socket(websocket, text: str, voice_uid: str) -> None:
@@ -822,12 +921,15 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
             }
         tool_results[tool_name] = result.to_dict()
         if result.success:
-            _set_last_context(session_id, {
-                "tool": tool_name,
-                "args": args,
-                "result": result.to_dict(),
-                "timestamp": __import__("time").time(),
-            })
+            _set_last_context(
+                session_id,
+                {
+                    "tool": tool_name,
+                    "args": args,
+                    "result": result.to_dict(),
+                    "timestamp": __import__("time").time(),
+                },
+            )
 
     def _first_match(patterns: list[str], text: str) -> bool:
         return any(p in text for p in patterns)
@@ -839,77 +941,163 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
         return text
 
     # System information
-    if _first_match([
-        "cpu", "memory", "ram", "disk", "storage", "uptime",
-        "gpu", "processes", "system info", "system status",
-        "how much ram", "how much cpu", "how much memory",
-        "what's using the most ram", "what's using the most cpu",
-        "is my gpu", "what gpu", "laptop temperature", "temperature"
-    ], lower):
+    if _first_match(
+        [
+            "cpu",
+            "memory",
+            "ram",
+            "disk",
+            "storage",
+            "uptime",
+            "gpu",
+            "processes",
+            "system info",
+            "system status",
+            "how much ram",
+            "how much cpu",
+            "how much memory",
+            "what's using the most ram",
+            "what's using the most cpu",
+            "is my gpu",
+            "what gpu",
+            "laptop temperature",
+            "temperature",
+        ],
+        lower,
+    ):
         await _maybe("system_info", {"query": lower})
     # Application control
-    elif _first_match([
-        "launch ", "open ", "start ", "run ", "firefox", "chrome",
-        "chromium", "vs code", "code ", "terminal", "nautilus",
-        "dolphin", "spotify", "vlc", "opera"
-    ], lower):
+    elif _first_match(
+        [
+            "launch ",
+            "open ",
+            "start ",
+            "run ",
+            "firefox",
+            "chrome",
+            "chromium",
+            "vs code",
+            "code ",
+            "terminal",
+            "nautilus",
+            "dolphin",
+            "spotify",
+            "vlc",
+            "opera",
+        ],
+        lower,
+    ):
         app = _after_phrases(lower, ["launch ", "open ", "start ", "run "])
         app = app.strip(".\"'?!").strip()
         if app in ["terminal", "the terminal"]:
             await _maybe("open_terminal", {})
         else:
-            await _maybe("launch_app", {"app": app})
-    elif _first_match(["close ", "kill "], lower) and not _first_match(["close all", "kill all"], lower):
+            await _maybe("launch_application", {"app": app})
+    elif _first_match(["close ", "kill "], lower) and not _first_match(
+        ["close all", "kill all"], lower
+    ):
         app = _after_phrases(lower, ["close ", "kill "])
         await _maybe("close_app", {"app": app})
-    elif _first_match(["what applications", "what's running", "list apps", "running apps", "what processes"], lower):
+    elif _first_match(
+        ["what applications", "what's running", "list apps", "running apps", "what processes"],
+        lower,
+    ):
         await _maybe("running_processes", {"limit": 15})
-    elif _first_match([
-        "look at my screen",
-        "what is on my screen",
-        "what's on my screen",
-        "read my screen",
-        "read the screen",
-        "explain what i'm seeing",
-        "explain this screen",
-        "what do you see",
-        "what is this",
-        "look at my",
-        "see what i'm",
-        "analyze my screen",
-        "analyze the screen",
-        "what's on the screen",
-        "what is on the screen",
-        "look at the screen",
-        "read this",
-        "look at this",
-        "what is this image",
-        "what's in this image",
-        "describe my screen",
-        "describe the screen",
-        "what is happening on my screen",
-        "what's happening on my screen",
-        "what is displayed",
-        "what's displayed",
-        "check my screen",
-        "see my screen",
-        "view my screen",
-        "what's open on my screen",
-        "what is open on my screen",
-    ], lower):
-        await _maybe("screenshot", {"analyze": True, "prompt": "Describe what is on this screen in detail, including any errors, text, windows, or important visual elements."})
+    elif _first_match(
+        [
+            "look at my screen",
+            "what is on my screen",
+            "what's on my screen",
+            "read my screen",
+            "read the screen",
+            "explain what i'm seeing",
+            "explain this screen",
+            "what do you see",
+            "what is this",
+            "look at my",
+            "see what i'm",
+            "analyze my screen",
+            "analyze the screen",
+            "what's on the screen",
+            "what is on the screen",
+            "look at the screen",
+            "read this",
+            "look at this",
+            "what is this image",
+            "what's in this image",
+            "describe my screen",
+            "describe the screen",
+            "what is happening on my screen",
+            "what's happening on my screen",
+            "what is displayed",
+            "what's displayed",
+            "check my screen",
+            "see my screen",
+            "view my screen",
+            "what's open on my screen",
+            "what is open on my screen",
+        ],
+        lower,
+    ):
+        await _maybe(
+            "screenshot",
+            {
+                "analyze": True,
+                "prompt": "Describe what is on this screen in detail, including any errors, text, windows, or important visual elements.",
+            },
+        )
     elif "screenshot" in lower:
         await _maybe("screenshot", {})
     # File operations
-    elif _first_match(["find file", "search file", "locate file", "find my ", "search for file", "where is my", "locate my", "find the ", "search the ", "find all "], lower):
-        query = _after_phrases(lower, [
-            "find file", "search file", "locate file", "find my ", "search for file",
-            "where is my", "locate my", "find the ", "search the ", "find all "
-        ])
+    elif _first_match(
+        [
+            "find file",
+            "search file",
+            "locate file",
+            "find my ",
+            "search for file",
+            "where is my",
+            "locate my",
+            "find the ",
+            "search the ",
+            "find all ",
+        ],
+        lower,
+    ):
+        query = _after_phrases(
+            lower,
+            [
+                "find file",
+                "search file",
+                "locate file",
+                "find my ",
+                "search for file",
+                "where is my",
+                "locate my",
+                "find the ",
+                "search the ",
+                "find all ",
+            ],
+        )
         query = query.strip(".\"'?!").strip()
         if query:
             await _maybe("file_search", {"query": query, "directory": str(Path.home())})
-    elif _first_match(["list files", "list directory", "show files", "show directory", "what files", "what's inside", "what is inside", "contents of", "show me the files", "show inside", "list inside"], lower):
+    elif _first_match(
+        [
+            "list files",
+            "list directory",
+            "show files",
+            "show directory",
+            "what files",
+            "what's inside",
+            "what is inside",
+            "contents of",
+            "show me the files",
+            "show inside",
+            "list inside",
+        ],
+        lower,
+    ):
         path = str(Path.home())
         for keyword in ["downloads", "documents", "desktop", "pictures", "home", "project"]:
             if keyword in lower:
@@ -918,16 +1106,37 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
                     path = os.path.expanduser("~/Desktop/Project Folder")
                 break
         await _maybe("list_directory", {"path": path})
-    elif _first_match(["read file", "open file", "read ", "show me ", "open the ", "open ", "read the "], lower) and not _first_match([
-        "open folder", "open downloads", "open documents", "open desktop", "open home", "open project"
-    ], lower):
-        path = _after_phrases(lower, [
-            "read file", "open file", "read the ", "read ", "show me ", "open the ", "open "
-        ])
+    elif _first_match(
+        ["read file", "open file", "read ", "show me ", "open the ", "open ", "read the "], lower
+    ) and not _first_match(
+        [
+            "open folder",
+            "open downloads",
+            "open documents",
+            "open desktop",
+            "open home",
+            "open project",
+        ],
+        lower,
+    ):
+        path = _after_phrases(
+            lower,
+            ["read file", "open file", "read the ", "read ", "show me ", "open the ", "open "],
+        )
         path = path.strip(".\"'?!").strip()
         if path:
             await _maybe("read_file", {"path": path})
-    elif _first_match(["open folder", "open downloads", "open documents", "open desktop", "open home", "open project"], lower):
+    elif _first_match(
+        [
+            "open folder",
+            "open downloads",
+            "open documents",
+            "open desktop",
+            "open home",
+            "open project",
+        ],
+        lower,
+    ):
         path_map = {
             "downloads": os.path.expanduser("~/Downloads"),
             "documents": os.path.expanduser("~/Documents"),
@@ -940,14 +1149,25 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
             if key in lower:
                 await _maybe("open_folder", {"path": val})
                 break
-    elif _first_match(["find recent", "recent files", "modified today", "recently modified"], lower):
+    elif _first_match(
+        ["find recent", "recent files", "modified today", "recently modified"], lower
+    ):
         await _maybe("find_recent_files", {"directory": str(Path.home()), "hours": 24, "limit": 20})
-    elif _first_match(["find all ", "all python files", "all pdf", "all images", "all jpg", "all png"], lower):
+    elif _first_match(
+        ["find all ", "all python files", "all pdf", "all images", "all jpg", "all png"], lower
+    ):
         ext = _after_phrases(lower, ["find all ", "all "])
         ext = ext.split()[0] if ext.split() else "py"
-        await _maybe("find_by_extension", {"extension": ext, "directory": str(Path.home()), "limit": 30})
-    elif _first_match(["create folder", "create directory", "make folder", "new folder", "make directory"], lower):
-        path = _after_phrases(lower, ["create folder", "create directory", "make folder", "new folder", "make directory"])
+        await _maybe(
+            "find_by_extension", {"extension": ext, "directory": str(Path.home()), "limit": 30}
+        )
+    elif _first_match(
+        ["create folder", "create directory", "make folder", "new folder", "make directory"], lower
+    ):
+        path = _after_phrases(
+            lower,
+            ["create folder", "create directory", "make folder", "new folder", "make directory"],
+        )
         path = path.strip(".\"'?!").strip()
         if path:
             await _maybe("create_folder", {"path": path})
@@ -956,24 +1176,41 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
         path = path.strip(".\"'?!").strip()
         if path:
             await _maybe("create_file", {"path": path})
-    elif _first_match(["delete file", "delete ", "remove file", "remove ", "trash "], lower) and not _first_match(["delete folder", "delete directory", "delete all"], lower):
+    elif _first_match(
+        ["delete file", "delete ", "remove file", "remove ", "trash "], lower
+    ) and not _first_match(["delete folder", "delete directory", "delete all"], lower):
         path = _after_phrases(lower, ["delete file", "delete ", "remove file", "remove ", "trash "])
         path = path.strip(".\"'?!").strip()
         if path:
             await _maybe("delete_file", {"path": path})
-    elif _first_match(["delete folder", "delete directory", "remove folder", "remove directory"], lower):
-        path = _after_phrases(lower, ["delete folder", "delete directory", "remove folder", "remove directory"])
+    elif _first_match(
+        ["delete folder", "delete directory", "remove folder", "remove directory"], lower
+    ):
+        path = _after_phrases(
+            lower, ["delete folder", "delete directory", "remove folder", "remove directory"]
+        )
         path = path.strip(".\"'?!").strip()
         if path:
             await _maybe("delete_file", {"path": path})
-    elif "web search" in lower or "search web" in lower or "look up" in lower or "search the internet" in lower or "search for" in lower:
-        query = _after_phrases(lower, [
-            "web search", "search web", "look up", "search the internet", "search for"
-        ])
+    elif (
+        "web search" in lower
+        or "search web" in lower
+        or "look up" in lower
+        or "search the internet" in lower
+        or "search for" in lower
+    ):
+        query = _after_phrases(
+            lower, ["web search", "search web", "look up", "search the internet", "search for"]
+        )
         query = query.strip(".\"'?!").strip()
         if query:
             await _maybe("web_search", {"query": query})
-    elif "remember " in lower and "what do you remember" not in lower and "recall" not in lower and "forget" not in lower:
+    elif (
+        "remember " in lower
+        and "what do you remember" not in lower
+        and "recall" not in lower
+        and "forget" not in lower
+    ):
         fact = _after_phrases(lower, ["remember ", "remember that "])
         fact = fact.strip(".\"'?!").strip()
         if fact:
@@ -983,20 +1220,32 @@ async def _route_tools(user_input: str, session_id: str) -> dict | None:
         query = query.strip(".\"'?!").strip()
         if query:
             await _maybe("forget_memory", {"query": query})
-    elif "what do you remember" in lower or "recall" in lower or "what is my" in lower or "do you remember" in lower:
+    elif (
+        "what do you remember" in lower
+        or "recall" in lower
+        or "what is my" in lower
+        or "do you remember" in lower
+    ):
         await _maybe("recall_memory", {"query": lower})
     else:
         last = _get_last_context(session_id)
         if last:
             last_tool = last.get("tool")
-            if last_tool == "open_folder" and _first_match([
-                "what's inside", "what is inside", "show inside",
-                "list inside", "contents", "what files"
-            ], lower):
+            if last_tool == "open_folder" and _first_match(
+                [
+                    "what's inside",
+                    "what is inside",
+                    "show inside",
+                    "list inside",
+                    "contents",
+                    "what files",
+                ],
+                lower,
+            ):
                 await _maybe("list_directory", {"path": last["args"].get("path", str(Path.home()))})
-            elif last_tool in ("read_file", "read_document") and _first_match([
-                "explain", "what is this", "summarize", "summarise", "what does this do"
-            ], lower):
+            elif last_tool in ("read_file", "read_document") and _first_match(
+                ["explain", "what is this", "summarize", "summarise", "what does this do"], lower
+            ):
                 content = last.get("result", {}).get("data", {}).get("content") or ""
                 if content:
                     tool_results["explain_context"] = {
@@ -1020,7 +1269,7 @@ def _plain_reply_from_tool_results(tool_results: dict) -> str:
             continue
         data = result.get("data") or {}
         if result.get("success"):
-            if tool == "launch_app":
+            if tool in ("launch_app", "launch_application"):
                 parts.append(f"Opened {data.get('launched')}.")
             elif tool == "open_file":
                 parts.append(f"Opened {data.get('opened')}.")
@@ -1039,9 +1288,21 @@ def _plain_reply_from_tool_results(tool_results: dict) -> str:
             elif tool == "copy_file":
                 parts.append(f"Copied {data.get('copied')} to {data.get('to')}.")
             elif tool == "remember_memory":
-                parts.append("Remembered.")
+                parts.append(
+                    "Saved to memory."
+                    if data.get("action") != "already_remembered"
+                    else "That was already saved."
+                )
+            elif tool == "update_memory":
+                parts.append("Updated that memory.")
+            elif tool == "clear_all_memories":
+                parts.append("Memory cleared.")
+            elif tool == "get_current_context":
+                bits = [f"{k}: {v}" for k, v in data.items() if v and k != "recent_paths"]
+                parts.append("Context: " + "; ".join(bits[:4]) if bits else "No active context.")
             elif tool == "forget_memory":
-                parts.append(f"Forgot {data.get('removed')} item(s).")
+                removed = data.get("removed") or 0
+                parts.append("Forgotten." if removed else "I couldn't find that in memory.")
             elif tool == "recall_memory":
                 facts = data.get("facts") or []
                 parts.append("Here's what I remember: " + "; ".join(facts[:5]))
@@ -1076,9 +1337,7 @@ async def handle_ws_confirm(
     session_ctx = session_context_store.get(session_id)
     if session_ctx.pending_tool != tool_name:
         with contextlib.suppress(Exception):
-            await websocket.send_json(
-                {"type": "response", "text": "No pending action to confirm."}
-            )
+            await websocket.send_json({"type": "response", "text": "No pending action to confirm."})
         return
     if not confirm:
         session_ctx.pending_tool = None
@@ -1096,10 +1355,11 @@ async def handle_ws_confirm(
     if not full_text.strip():
         full_text = "Done."
     logger.info("[voice:%s] Confirmed action reply: %s", voice_uid, full_text)
+    session_context_store.get(session_id).record_exchange("", full_text)
     await memory_manager.add_message(session_id, "assistant", full_text)
-    sentences = [
-        s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()
-    ] or [full_text]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()] or [
+        full_text
+    ]
     await websocket.send_json({"type": "status", "status": "generating_speech"})
     await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
     for sentence in sentences:
@@ -1108,10 +1368,29 @@ async def handle_ws_confirm(
 
 
 async def handle_user_input(
-    user_input: str, session_id: str, websocket, voice_uid: str = ""
+    user_input: str,
+    session_id: str,
+    websocket,
+    voice_uid: str = "",
+    voice_cycle_id: str = "",
 ) -> None:
     """Process a single user utterance via the typed orchestrator, then TTS."""
     from starlette.websockets import WebSocketDisconnect  # noqa: F401
+
+    interaction_id = uuid.uuid4().hex[:12]
+
+    async def _tool_results_payload(tools_this: list[dict]) -> list[dict]:
+        payload = []
+        for item in tools_this:
+            result = item.get("result") or {}
+            payload.append(
+                {
+                    "tool": item.get("tool") or "",
+                    "args": item.get("args") or {},
+                    "verified": bool(result.get("success")) if isinstance(result, dict) else True,
+                }
+            )
+        return payload
 
     await memory_manager.add_message(session_id, "user", user_input)
 
@@ -1126,12 +1405,24 @@ async def handle_user_input(
     try:
         # --- voice/text confirmation of a pending orchestrator approval ---------
         session_ctx = session_context_store.get(session_id)
+        session_ctx.record_exchange(user_input)
         pending_tool = session_ctx.pending_tool
         if pending_tool and capability_policy.has_pending(session_id, pending_tool):
             lowered = user_input.strip().lower().rstrip(".!?")
             if lowered in (
-                "yes", "yeah", "yep", "sure", "okay", "ok", "do it", "confirm",
-                "proceed", "go ahead", "please", "yes please", "go",
+                "yes",
+                "yeah",
+                "yep",
+                "sure",
+                "okay",
+                "ok",
+                "do it",
+                "confirm",
+                "proceed",
+                "go ahead",
+                "please",
+                "yes please",
+                "go",
             ):
                 await handle_ws_confirm(session_id, pending_tool, True, websocket, voice_uid)
                 return
@@ -1141,7 +1432,9 @@ async def handle_user_input(
 
         context = await process_command(user_input, session_id=session_id)
 
+        before_tools = len(session_ctx.tool_results)
         decision = await orchestrator.run(user_input, session_id, session_ctx, context)
+        tools_this = list(session_ctx.tool_results)[before_tools:]
 
         if decision.kind == "confirm":
             await websocket.send_json(
@@ -1179,15 +1472,11 @@ async def handle_user_input(
                                     ),
                                 }
                             },
-                            "message": pending.get(
-                                "prompt", "Please confirm this action."
-                            ),
+                            "message": pending.get("prompt", "Please confirm this action."),
                         }
                     )
                     return
-                full_text = strip_markdown_for_speech(
-                    _plain_reply_from_tool_results(fallback)
-                )
+                full_text = strip_markdown_for_speech(_plain_reply_from_tool_results(fallback))
                 if full_text:
                     logger.info("[voice:%s] Fallback reply: %s", voice_uid, full_text[:200])
                     await memory_manager.add_message(session_id, "assistant", full_text)
@@ -1198,7 +1487,16 @@ async def handle_user_input(
                     await websocket.send_json({"type": "audio_queue", "count": len(sentences)})
                     for sentence in sentences:
                         await _stream_sentence_audio(websocket, sentence, voice_uid)
-                    await websocket.send_json({"type": "response", "text": full_text, "audio": None})
+                    await websocket.send_json(
+                        {
+                            "type": "response",
+                            "text": full_text,
+                            "audio": None,
+                            "interaction_id": interaction_id,
+                            "voice_cycle_id": voice_cycle_id or None,
+                            "tool_results": await _tool_results_payload(tools_this),
+                        }
+                    )
                     mark_terminal()
                     return
             await websocket.send_json(
@@ -1215,11 +1513,10 @@ async def handle_user_input(
             full_text = "I couldn't generate a response. Please try again."
 
         logger.info("[voice:%s] LLM: %s", voice_uid, full_text.strip())
+        session_ctx.record_exchange(user_input, full_text.strip())
         await memory_manager.add_message(session_id, "assistant", full_text.strip())
 
-        sentences = [
-            s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()
-        ]
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", full_text) if s.strip()]
         if not sentences:
             sentences = [full_text]
 
@@ -1234,6 +1531,9 @@ async def handle_user_input(
                 "type": "response",
                 "text": full_text.strip(),
                 "audio": None,
+                "interaction_id": interaction_id,
+                "voice_cycle_id": voice_cycle_id or None,
+                "tool_results": await _tool_results_payload(tools_this),
             }
         )
         mark_terminal()

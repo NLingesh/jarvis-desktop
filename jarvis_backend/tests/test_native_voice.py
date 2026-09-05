@@ -170,13 +170,16 @@ def test_hands_free_auto_ends_utterance(fake_audio):
     s.connect()
     s.vad.start()
     assert s.start_listening("hands_free") is True
-    # Speech then silence -> VAD fires speech_end -> utterance emitted.
+    # Speech then silence -> endpointing grace (800 ms) fires speech_end.
     _push_audio(s, 1.0, loud=True)
     _push_audio(s, 1.0, loud=False)
-    time.sleep(0.2)
+    time.sleep(1.5)
     s.disconnect()
     assert len(utterances) == 1
     assert len(utterances[0]) > 0
+    meta = s.last_utterance_meta()
+    assert meta is not None
+    assert meta["finalization_reason"] == "endpoint"
 
 
 def test_cancel_discards_recording(fake_audio):

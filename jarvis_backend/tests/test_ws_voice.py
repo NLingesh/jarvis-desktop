@@ -36,6 +36,7 @@ def test_ws_rejects_missing_token(client):
 
 def test_ws_ping_gets_pong(client):
     with client.websocket_connect("/ws/voice?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "ping"})
         data = ws.receive_json()
     assert data == {"type": "pong"}
@@ -43,6 +44,7 @@ def test_ws_ping_gets_pong(client):
 
 def test_ws_audio_chunk_without_start_is_rejected(client):
     with client.websocket_connect("/ws/voice?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "audio_chunk", "data": base64.b64encode(b"\x00" * 1600).decode()})
         data = ws.receive_json()
     assert data["type"] == "error"
@@ -51,6 +53,7 @@ def test_ws_audio_chunk_without_start_is_rejected(client):
 
 def test_ws_streaming_flow_reports_error_when_stt_unavailable(client):
     with client.websocket_connect("/ws/voice?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json(
             {
                 "type": "audio_start",
@@ -68,3 +71,10 @@ def test_ws_streaming_flow_reports_error_when_stt_unavailable(client):
         data = ws.receive_json()
     assert data["type"] == "error"
     assert "Speech-to-text is unavailable" in data["message"]
+
+
+def _drain_server(ws):
+    """The server sends a ``server`` build-welcome message on connect; consume it."""
+    msg = ws.receive_json()
+    assert msg.get("type") == "server"
+    assert msg.get("build")

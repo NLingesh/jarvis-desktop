@@ -60,6 +60,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('voice-control', handler);
   },
 
+  onWindowDragState: (callback) => {
+    const handler = (_event, dragging) => callback(Boolean(dragging));
+    ipcRenderer.on('window-drag-state', handler);
+    return () => ipcRenderer.removeListener('window-drag-state', handler);
+  },
+
   getVaultPath: () => ipcRenderer.invoke('get-vault-path'),
   openVault: () => ipcRenderer.invoke('open-vault'),
 

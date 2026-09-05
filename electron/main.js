@@ -153,16 +153,84 @@ let sessionToken = '';
 let windowMode = 'orb';
 
 // Single expanding window: the app is one frameless transparent window that
-// grows from a 96x96 orb, through a larger quick-actions canvas, to the full
+// grows from the 72×72 orb, through a larger quick-actions canvas, to the full
 // panel sheet. The orb anchor stays screen-stable across every resize.
-const ORB_WINDOW = { width: 96, height: 96 };
-const MENU_WINDOW = { width: 240, height: 240 };
-const PANEL_WINDOW = { width: 380, height: 560 };
+//
+// The "main window" (panel) and the "bubble window" (orb) are two geometry
+// modes of this one BrowserWindow. All bounds/position IPC routes through the
+// explicit helpers below: `setMainWindowBounds` (guarded by the configured main
+// minimum) or `setBubbleBounds`/`setBubblePosition` (compact orb geometry). A
+// bubble-sized bounds request can therefore never collapse the main window.
+const BUBBLE_WINDOW_SIZE = 72;
+const MENU_WINDOW_SIZE = 240;
+const MAIN_WINDOW_DEFAULT = { width: 640, height: 640 };
+const MAIN_WINDOW_MIN_WIDTH = 640;
+const MAIN_WINDOW_MIN_HEIGHT = 640;
 const MODE_SPECS = {
-  orb: { width: ORB_WINDOW.width, height: ORB_WINDOW.height, anchorX: 48, anchorY: 48 },
-  menu: { width: MENU_WINDOW.width, height: MENU_WINDOW.height, anchorX: 120, anchorY: 120 },
-  panel: { width: PANEL_WINDOW.width, height: PANEL_WINDOW.height, anchorX: 190, anchorY: 520 },
+  orb: { width: BUBBLE_WINDOW_SIZE, height: BUBBLE_WINDOW_SIZE, anchorX: 36, anchorY: 36 },
+  menu: { width: MENU_WINDOW_SIZE, height: MENU_WINDOW_SIZE, anchorX: 120, anchorY: 120 },
+  panel: {
+    width: MAIN_WINDOW_DEFAULT.width,
+    height: MAIN_WINDOW_DEFAULT.height,
+    anchorX: 320,
+    anchorY: 320,
+  },
 };
+
+// Diagnostic bounds logging is gated behind an explicit flag; it prints only
+// numeric window geometry (never secrets or personal content).
+const DEBUG_BOUNDS = process.env.JARVIS_DEBUG_BOUNDS === '1';
+
+function getMainWindow() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+
+function logBounds(label, requested, previous, final) {
+  if (!DEBUG_BOUNDS) return;
+  log(
+    `[bounds] ${label} requested=${JSON.stringify(requested)} ` +
+      `previous=${JSON.stringify(previous)} final=${JSON.stringify(final)}`,
+  );
+}
+
+// The only place the main (panel) window may change size. Refuses any request
+// below the configured minimum, so a stray bubble geometry (72×72, stale orb
+// dims, drag cleanup, etc.) can never collapse the conversation window.
+function setMainWindowBounds(win, bounds) {
+  if (!win || win.isDestroyed()) return false;
+  const { width, height } = bounds;
+  if (width < MAIN_WINDOW_MIN_WIDTH || height < MAIN_WINDOW_MIN_HEIGHT) {
+    log(
+      `[bounds] main-window bounds rejected ${width}x${height} ` +
+        `(minimum ${MAIN_WINDOW_MIN_WIDTH}x${MAIN_WINDOW_MIN_HEIGHT})`,
+    );
+    return false;
+  }
+  const previous = win.getBounds();
+  win.setBounds(bounds);
+  logBounds('set-main-bounds', bounds, previous, win.getBounds());
+  return true;
+}
+
+// Bubble-geometry bounds change (orb/menu). Only ever the compact bubble
+// dimensions; it never resizes the main conversation layout.
+function setBubbleBounds(win, bounds) {
+  if (!win || win.isDestroyed()) return false;
+  const previous = win.getBounds();
+  win.setBounds(bounds);
+  logBounds('set-bubble-bounds', bounds, previous, win.getBounds());
+  return true;
+}
+
+// Bubble-geometry position change (native-drag persist, drag IPC). Position
+// only — never a resize, so a drag-end can never trigger a window resize.
+function setBubblePosition(win, x, y) {
+  if (!win || win.isDestroyed()) return false;
+  const previous = win.getBounds();
+  win.setPosition(x, y);
+  logBounds('set-bubble-position', { x, y }, previous, win.getBounds());
+  return true;
+}
 
 function log(msg) {
   const ts = new Date().toISOString();
@@ -241,7 +309,7 @@ function getDefaultOrbPosition() {
   const { screen } = require('electron');
   const display = screen.getPrimaryDisplay();
   const { x, y, width, height } = display.workArea;
-  return { x: x + width - 96 - 24, y: y + height - 96 - 24 };
+  return { x: x + width - BUBBLE_WINDOW_SIZE - 24, y: y + height - BUBBLE_WINDOW_SIZE - 24 };
 }
 
 function clamp(v, min, max) {
@@ -257,21 +325,28 @@ function currentOrbAnchor() {
 
 // Where the orb currently sits on screen (window top-left + anchor).
 function currentOrbCenter() {
-  if (!mainWindow) return getDefaultOrbPosition();
-  const [x, y] = mainWindow.getPosition();
+  const win = getMainWindow();
+  if (!win) return getDefaultOrbPosition();
+  const [x, y] = win.getPosition();
   const a = currentOrbAnchor();
   return { x: x + a.x, y: y + a.y };
 }
 
 function applyWindowMode(mode, cx, cy) {
-  if (!mainWindow) return { x: cx, y: cy };
+  const win = getMainWindow();
+  if (!win) return { x: cx, y: cy };
   const spec = MODE_SPECS[mode] || MODE_SPECS.orb;
   const area = getWorkArea();
   const centerX = typeof cx === 'number' ? cx : currentOrbCenter().x;
   const centerY = typeof cy === 'number' ? cy : currentOrbCenter().y;
   const x = clamp(Math.round(centerX - spec.anchorX), area.x, area.x + area.width - spec.width);
   const y = clamp(Math.round(centerY - spec.anchorY), area.y, area.y + area.height - spec.height);
-  mainWindow.setBounds({ x, y, width: spec.width, height: spec.height });
+  const bounds = { x, y, width: spec.width, height: spec.height };
+  // Panel mode is the main conversation window (guarded by its minimum size);
+  // orb/menu are bubble-geometry modes and can never touch main-window bounds.
+  const applied =
+    mode === 'panel' ? setMainWindowBounds(win, bounds) : setBubbleBounds(win, bounds);
+  if (!applied) return { x: centerX, y: centerY };
   windowMode = mode;
   const appliedCenter = { x: x + spec.anchorX, y: y + spec.anchorY };
   saveOrbPosition(appliedCenter.x, appliedCenter.y);
@@ -392,8 +467,8 @@ function createWindow() {
     y,
     minWidth: spec.width,
     minHeight: spec.height,
-    maxWidth: PANEL_WINDOW.width,
-    maxHeight: PANEL_WINDOW.height,
+    maxWidth: MAIN_WINDOW_DEFAULT.width,
+    maxHeight: MAIN_WINDOW_DEFAULT.height,
     resizable: false,
     frame: false,
     transparent: true,
@@ -412,6 +487,24 @@ function createWindow() {
       enableRemoteModule: false,
     },
     icon: getIconPath(),
+  });
+
+  // Ctrl+Space toggles voice capture. While the window is focused this event
+  // fires first (and prevents the key reaching the page); when the window is
+  // not focused, the global shortcut below provides the same toggle.
+  let ctrlSpaceDown = false;
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const controlKey = input.key === 'Control' || input.code === 'ControlLeft' || input.code === 'ControlRight';
+    if (input.type === 'keyDown' && input.code === 'Space' && input.control) {
+      if (ctrlSpaceDown) return; // ignore OS key auto-repeat
+      ctrlSpaceDown = true;
+      event.preventDefault();
+      log('[shortcut] Ctrl+Space pressed while focused (toggle voice)');
+      sendToRenderer('voice-control', 'toggle');
+    } else if (input.type === 'keyUp' && ctrlSpaceDown && (input.code === 'Space' || controlKey)) {
+      ctrlSpaceDown = false;
+      event.preventDefault();
+    }
   });
 
   mainWindow.loadURL(`http://${BACKEND_HOST}:${BACKEND_PORT}`);
@@ -438,6 +531,25 @@ function createWindow() {
     const c = currentOrbCenter();
     saveOrbPosition(c.x, c.y);
   });
+
+  // Native dragging is handled by the OS (`-webkit-app-region: drag`), so no
+  // renderer/JS loop moves the window. While a native drag is in progress the
+  // renderer pauses nonessential CSS animations to avoid compositor artifacts
+  // on the transparent window. A short debounce turns the flag off once the
+  // window stops moving (drag end, or restore/setPosition that settles).
+  let dragStateTimer = null;
+  const sendDragState = (dragging) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (windowMode !== 'orb') return;
+    if (dragStateTimer) clearTimeout(dragStateTimer);
+    if (dragging) {
+      sendToRenderer('window-drag-state', true);
+      dragStateTimer = setTimeout(() => sendDragState(false), 200);
+    } else {
+      sendToRenderer('window-drag-state', false);
+    }
+  };
+  mainWindow.on('move', () => sendDragState(true));
 
   mainWindow.on('closed', () => {
     log('Panel window closed');
@@ -569,12 +681,13 @@ function closePanel() {
 }
 
 function updatePanelPosition(x, y) {
-  if (!mainWindow) return;
+  const win = getMainWindow();
+  if (!win) return;
   const area = getWorkArea();
-  const [width, height] = mainWindow.getSize();
+  const [width, height] = win.getSize();
   const clampedX = Math.max(area.x + 10, Math.min(x, area.x + area.width - width - 10));
   const clampedY = Math.max(area.y + 10, Math.min(y, area.y + area.height - height - 10));
-  mainWindow.setPosition(clampedX, clampedY);
+  setBubblePosition(win, clampedX, clampedY);
 }
 
 function showMainWindow() {
@@ -728,9 +841,12 @@ async function init() {
   const voiceShortcut = process.env.VOICE_SHORTCUT || 'Control+Space';
   try {
     globalShortcut.register(voiceShortcut, () => {
-      log('[shortcut] Ctrl+Space received');
-      sendToRenderer('voice-control', 'toggle');
-      log('[shortcut] invoked voice-control toggle');
+      // When focused, before-input-event provides true press/release semantics.
+      // Keep the legacy toggle behavior as a global fallback in the background.
+      if (!mainWindow || !mainWindow.isFocused()) {
+        log('[shortcut] Ctrl+Space received (global toggle)');
+        sendToRenderer('voice-control', 'toggle');
+      }
     });
     log(`Registered global shortcut: ${voiceShortcut}`);
   } catch (err) {
@@ -832,13 +948,21 @@ ipcMain.handle('get-orb-position', () => {
   return c;
 });
 ipcMain.handle('set-orb-position', (_event, cx, cy) => {
-  if (!mainWindow) return { x: cx, y: cy };
+  const win = getMainWindow();
+  if (!win) return { x: cx, y: cy };
+  // Bubble position requests only ever move the compact orb window. If the
+  // window is currently the main conversation panel, a stale bubble request
+  // must not reposition (or resize) it — ignore it.
+  if (windowMode === 'panel') {
+    log('[bounds] set-orb-position ignored: window is in main (panel) mode');
+    return currentOrbCenter();
+  }
   const a = currentOrbAnchor();
   const area = getWorkArea();
-  const [width, height] = mainWindow.getSize();
+  const [width, height] = win.getSize();
   const x = clamp(Math.round(cx - a.x), area.x, area.x + area.width - width);
   const y = clamp(Math.round(cy - a.y), area.y, area.y + area.height - height);
-  mainWindow.setPosition(x, y);
+  setBubblePosition(win, x, y);
   const appliedCenter = { x: x + a.x, y: y + a.y };
   saveOrbPosition(appliedCenter.x, appliedCenter.y);
   return appliedCenter;

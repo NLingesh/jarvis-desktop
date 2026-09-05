@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +25,23 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 from managers.native_audio import list_input_devices
 from managers.native_voice import NativeVoiceSession
+from modules.limits import audio_chunk_allowed, legacy_audio_blob_allowed
 from modules.proactive import ProactiveMonitor
+from modules.wake_normalize import normalize_wake_phrase
+from modules.window_control import (
+    notify_ack as notify_window_ack,
+)
+from modules.window_control import (
+    register_socket as register_window_socket,
+)
+from modules.window_control import (
+    unregister_socket as unregister_window_socket,
+)
 from routes.adaptive import router as adaptive_router
 from routes.auth import router as auth_router
 from routes.automation import router as automation_router
 from routes.calendar import router as calendar_router
+from routes.chat import router as chat_router
 from routes.code_routes import router as code_router
 from routes.git_routes import router as git_router
 from routes.llm import router as llm_router
@@ -70,7 +83,6 @@ from routes.state import (
     voice_manager,
     workflow_manager,
 )
-from modules.limits import audio_chunk_allowed, legacy_audio_blob_allowed
 from routes.stt import router as stt_router
 from routes.system import router as system_router
 from routes.tasks import router as tasks_router
@@ -259,6 +271,7 @@ app.include_router(mail_router)
 app.include_router(notes_router)
 app.include_router(calendar_router)
 app.include_router(llm_router)
+app.include_router(chat_router)
 app.include_router(stt_router)
 app.include_router(settings_router)
 app.include_router(vision_router)
@@ -359,7 +372,9 @@ STT_SEMAPHORE = asyncio.Semaphore(4)
 WS_IDLE_TIMEOUT = 90
 
 
-async def _finalize_audio_stream(stream, websocket, voice_uid: str) -> str:
+async def _finalize_audio_stream(
+    stream, websocket, voice_uid: str, voice_cycle_id: str = ""
+) -> str:
     """Finalize a streaming recognizer and return its transcription."""
     try:
         async with STT_SEMAPHORE:
@@ -370,6 +385,8 @@ async def _finalize_audio_stream(stream, websocket, voice_uid: str) -> str:
             await websocket.send_json(
                 {
                     "type": "error",
+                    "error_scope": "stt",
+                    "voice_cycle_id": voice_cycle_id or None,
                     "message": "Speech recognition timed out. Please try again.",
                 }
             )
@@ -379,26 +396,92 @@ async def _finalize_audio_stream(stream, websocket, voice_uid: str) -> str:
         logger.error("[voice:%s] STT failed: %s", voice_uid, message)
         with contextlib.suppress(Exception):
             await websocket.send_json(
-                {"type": "error", "message": f"Speech recognition failed: {message}"}
+                {
+                    "type": "error",
+                    "error_scope": "stt",
+                    "voice_cycle_id": voice_cycle_id or None,
+                    "message": f"Speech recognition failed: {message}",
+                }
             )
         return ""
     if not user_input:
-        if not stt.available:
-            detail = (
-                "Speech recognition engine is not ready. Install a Vosk model via "
-                "scripts/download-vosk-model.sh, or set OPENAI_API_KEY for cloud fallback."
-            )
-        elif stt.available and not stt.has_cloud_fallback:
-            detail = (
-                "I heard audio but could not transcribe it. Vosk returned no text and no "
-                "cloud fallback (OPENAI_API_KEY) is configured."
-            )
+        if stt.available and stt.has_cloud_fallback:
+            # Genuine no-speech: a non-blocking, subtle mic status -- never a
+            # red error card, and never attached to a prior command's result.
+            logger.info("[voice:%s] STT returned no text (no speech)", voice_uid)
+            with contextlib.suppress(Exception):
+                await websocket.send_json(
+                    {
+                        "type": "voice_status",
+                        "status": "no_speech",
+                        "voice_cycle_id": voice_cycle_id or None,
+                        "message": "I didn't catch that. Try again.",
+                    }
+                )
         else:
-            detail = "I could not hear any speech. Please speak again."
-        logger.info("[voice:%s] STT returned no text (%s)", voice_uid, detail)
-        with contextlib.suppress(Exception):
-            await websocket.send_json({"type": "error", "message": detail})
+            if not stt.available:
+                detail = (
+                    "Speech recognition engine is not ready. Install a Vosk model via "
+                    "scripts/download-vosk-model.sh, or set OPENAI_API_KEY for cloud fallback."
+                )
+            else:
+                detail = (
+                    "I heard audio but could not transcribe it. Vosk returned no text and no "
+                    "cloud fallback (OPENAI_API_KEY) is configured."
+                )
+            logger.info("[voice:%s] STT returned no text (%s)", voice_uid, detail)
+            with contextlib.suppress(Exception):
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "error_scope": "stt",
+                        "voice_cycle_id": voice_cycle_id or None,
+                        "message": detail,
+                    }
+                )
     return user_input
+
+
+async def _dispatch_user_input(
+    user_input: str,
+    session_id: str,
+    websocket,
+    voice_uid: str,
+    voice_cycle_id: str = "",
+) -> None:
+    """Dispatch a finalized spoken transcript with wake-phrase normalization.
+
+    Only final transcripts reach this point -- partial STT hypotheses are
+    streamed to the UI untouched.  A leading phonetic wake variant ("jay er
+    vis open my Downloads folder") is stripped to the bare command ("open my
+    Downloads folder"); everything after the wake phrase is preserved exactly.
+    A wake phrase alone is acknowledged without dispatching a command.  Only
+    safe wake-state metadata is logged, never raw audio or transcripts.
+    """
+    wake = normalize_wake_phrase(user_input)
+    if wake.matched:
+        logger.info(
+            "[voice:%s] wake normalized variant=%r command_chars=%d wake_only=%s",
+            voice_uid,
+            wake.variant,
+            len(wake.command),
+            wake.wake_only,
+        )
+        if wake.wake_only:
+            with contextlib.suppress(Exception):
+                await websocket.send_json(
+                    {
+                        "type": "response",
+                        "text": "Yes? What do you need?",
+                        "audio": None,
+                        "voice_cycle_id": voice_cycle_id or None,
+                    }
+                )
+            return
+        user_input = wake.command
+    await handle_user_input(
+        user_input, session_id, websocket, voice_uid, voice_cycle_id=voice_cycle_id
+    )
 
 
 @app.websocket("/ws/voice")
@@ -406,8 +489,11 @@ async def websocket_endpoint(websocket: WebSocket):
     await validate_ws_token(websocket)
     await websocket.accept()
     _connected_sockets.add(websocket)
+    register_window_socket(websocket)
     voice_uid = uuid.uuid4().hex[:8]
     logger.info("[voice:%s] connection open (peer=%s)", voice_uid, websocket.client)
+    with contextlib.suppress(Exception):
+        await websocket.send_json({"type": "server", "build": BUILD_FINGERPRINT})
     session_id = await memory_manager.create_session()
     pending_stream = None
     wake_detector = None
@@ -439,12 +525,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
+            elif msg_type == "window_action_ack":
+                request_id = data.get("request_id")
+                if request_id:
+                    notify_window_ack(request_id)
             elif msg_type == "text":
                 user_input = data.get("content", "").strip()
                 if not user_input:
                     continue
                 logger.info("[voice:%s] text input (%d chars)", voice_uid, len(user_input))
-                await handle_user_input(user_input, session_id, websocket, voice_uid)
+                await handle_user_input(
+                    user_input,
+                    session_id,
+                    websocket,
+                    voice_uid,
+                    voice_cycle_id=uuid.uuid4().hex[:12],
+                )
             elif msg_type == "wake_start":
                 if wake_detector is not None:
                     wake_detector.close()
@@ -504,9 +600,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.warning(
                         "[voice:%s] audio chunk exceeds limits, discarding utterance", voice_uid
                     )
-                    await websocket.send_json(
-                        {"type": "error", "message": "Audio chunk too large"}
-                    )
+                    await websocket.send_json({"type": "error", "message": "Audio chunk too large"})
                     pending_stream.abandon()
                     pending_stream = None
                     continue
@@ -523,12 +617,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     voice_uid,
                     audio_bytes / 1024,
                 )
-                user_input = await _finalize_audio_stream(pending_stream, websocket, voice_uid)
+                voice_cycle_id = uuid.uuid4().hex[:12]
+                user_input = await _finalize_audio_stream(
+                    pending_stream, websocket, voice_uid, voice_cycle_id
+                )
                 pending_stream = None
                 if not user_input:
                     continue
                 logger.info("[voice:%s] User (voice) %d chars", voice_uid, len(user_input))
-                await handle_user_input(user_input, session_id, websocket, voice_uid)
+                await _dispatch_user_input(
+                    user_input, session_id, websocket, voice_uid, voice_cycle_id
+                )
             elif msg_type == "audio":
                 # Legacy whole-blob payload (backwards compatible).
                 audio_base64 = data.get("audio_base64") or data.get("audio")
@@ -547,6 +646,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     continue
                 await websocket.send_json({"type": "status", "status": "transcribing"})
+                voice_cycle_id = uuid.uuid4().hex[:12]
                 try:
                     async with STT_SEMAPHORE:
                         user_input = await asyncio.to_thread(stt.transcribe_base64, audio_base64)
@@ -555,6 +655,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.send_json(
                         {
                             "type": "error",
+                            "error_scope": "stt",
+                            "voice_cycle_id": voice_cycle_id,
                             "message": f"Speech recognition failed: {e}",
                         }
                     )
@@ -562,13 +664,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not user_input:
                     await websocket.send_json(
                         {
-                            "type": "error",
-                            "message": "I could not hear any speech. Please try again.",
+                            "type": "voice_status",
+                            "status": "no_speech",
+                            "voice_cycle_id": voice_cycle_id,
+                            "message": "I didn't catch that. Try again.",
                         }
                     )
                     continue
                 logger.info("[voice:%s] User (voice) %d chars", voice_uid, len(user_input))
-                await handle_user_input(user_input, session_id, websocket, voice_uid)
+                await _dispatch_user_input(
+                    user_input, session_id, websocket, voice_uid, voice_cycle_id
+                )
             elif msg_type == "confirm":
                 tool_name = data.get("tool")
                 confirm = bool(data.get("confirm", False))
@@ -579,20 +685,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         tool_args["confirm"] = True
                         try:
                             result = await tool_registry.execute_tool(tool_name, tool_args)
-                            await websocket.send_json({
-                                "type": "response",
-                                "text": f"Done. {result.data if result.success else result.error}",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "type": "response",
+                                    "text": f"Done. {result.data if result.success else result.error}",
+                                }
+                            )
                         except Exception as exc:
-                            await websocket.send_json({
-                                "type": "response",
-                                "text": f"Action failed: {exc}",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "type": "response",
+                                    "text": f"Action failed: {exc}",
+                                }
+                            )
                     else:
-                        await websocket.send_json({
-                            "type": "response",
-                            "text": "Action cancelled.",
-                        })
+                        await websocket.send_json(
+                            {
+                                "type": "response",
+                                "text": "Action cancelled.",
+                            }
+                        )
                     pending_tool_confirmations.pop(session_id, None)
                 else:
                     await handle_ws_confirm(session_id, tool_name, confirm, websocket, voice_uid)
@@ -607,6 +719,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "error", "message": str(e)})
     finally:
         _connected_sockets.discard(websocket)
+        unregister_window_socket(websocket)
         if pending_stream is not None:
             # The utterance never finished cleanly; abandon the worker thread.
             pending_stream.abandon()
@@ -624,40 +737,73 @@ NATIVE_VOICE_TIMEOUT = 120
 NO_USABLE_SIGNAL_RMS = 0.005
 
 
-async def _native_transcribe(session, pcm: bytes, websocket, voice_uid: str) -> str:
+async def _native_transcribe(
+    session, pcm: bytes, websocket, voice_uid: str, voice_cycle_id: str = ""
+) -> str:
     """Transcribe a captured utterance using the STT manager.
 
     Reports precise, local-first failure messages instead of a generic error
     when the microphone path is at fault (no device / muted / no signal).
+    A healthy mic that captured audio but produced no words is a *no-speech*
+    cycle (``voice_status``), not a hard error.
     """
     if not pcm:
         with contextlib.suppress(Exception):
             await websocket.send_json(
-                {"type": "error", "message": "I didn't catch any audio. Please speak again."}
+                {
+                    "type": "voice_status",
+                    "status": "no_speech",
+                    "voice_cycle_id": voice_cycle_id or None,
+                    "message": "I didn't catch that. Try again.",
+                }
             )
         return ""
     rms, peak = _pcm_level(pcm)
     muted = _source_muted(session)
+    started = time.monotonic()
     try:
         async with STT_SEMAPHORE:
-            started = time.monotonic()
             user_input = await asyncio.to_thread(stt_manager.transcribe_pcm16, pcm, 16000)
             took_ms = (time.monotonic() - started) * 1000
     except Exception as e:
         logger.error("[voice:%s] native STT failed: %s", voice_uid, e)
         with contextlib.suppress(Exception):
             await websocket.send_json(
-                {"type": "error", "message": f"Speech recognition failed: {e}"}
+                {
+                    "type": "error",
+                    "error_scope": "stt",
+                    "voice_cycle_id": voice_cycle_id or None,
+                    "message": f"Speech recognition failed: {e}",
+                }
             )
         return ""
     _log_native_stt_diagnostic(session, pcm, rms, peak, muted, user_input, took_ms, voice_uid)
     if not user_input:
         if muted is True:
             detail = "Microphone is muted."
+            scope = "stream"
         elif rms < NO_USABLE_SIGNAL_RMS:
             detail = "No usable microphone signal detected."
+            scope = "stream"
         else:
-            detail = "Audio received, but no speech was recognized."
+            # Audible, unmuted audio with no recognized words: a harmless,
+            # non-blocking voice-cycle status -- never a red error card.
+            logger.info(
+                "[voice:%s] native STT no speech (rms=%.4f peak=%.4f)",
+                voice_uid,
+                rms,
+                peak,
+            )
+            with contextlib.suppress(Exception):
+                await websocket.send_json(
+                    {
+                        "type": "voice_status",
+                        "status": "no_speech",
+                        "voice_cycle_id": voice_cycle_id or None,
+                        "message": "I didn't catch that. Try again.",
+                    }
+                )
+            return user_input
         logger.info(
             "[voice:%s] native STT no text (rms=%.4f peak=%.4f muted=%s): %s",
             voice_uid,
@@ -667,7 +813,14 @@ async def _native_transcribe(session, pcm: bytes, websocket, voice_uid: str) -> 
             detail,
         )
         with contextlib.suppress(Exception):
-            await websocket.send_json({"type": "error", "message": detail})
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error_scope": scope,
+                    "voice_cycle_id": voice_cycle_id or None,
+                    "message": detail,
+                }
+            )
     return user_input
 
 
@@ -728,8 +881,14 @@ def _native_connect_message(reason: str, session) -> str:
 
 
 def _log_native_stt_diagnostic(
-    session, pcm: bytes, rms: float, peak: float, muted: bool | None, user_input: str,
-    took_ms: float, voice_uid: str,
+    session,
+    pcm: bytes,
+    rms: float,
+    peak: float,
+    muted: bool | None,
+    user_input: str,
+    took_ms: float,
+    voice_uid: str,
 ) -> None:
     """Log safe STT diagnostics: device/source, selected status, level, timing.
 
@@ -755,18 +914,20 @@ def _log_native_stt_diagnostic(
         if device_id is not None:
             is_default = any(d.get("is_default") for d in devices if d.get("id") == device_id)
     samples = len(pcm) // 2
-    block_samples = max(int(sample_rate * 30 / 1000), 1)
-    chunks = (samples + block_samples - 1) // block_samples
     model_ready = None
     model_loaded = None
     with contextlib.suppress(Exception):
         diag = stt_manager.diagnostics()
         model_ready = diag.get("ready")
         model_loaded = diag.get("vosk_loaded")
+    meta = {}
+    with contextlib.suppress(Exception):
+        meta = session.last_utterance_meta() or {} if session is not None else {}
     logger.info(
         "[voice:%s] stt: device=%s name=%r default=%s sr=%d capture_rate=%d ch=%d "
         "samples=%d bytes=%d chunks=%d rms=%.4f peak=%.4f muted=%s "
-        "model_ready=%s model_loaded=%s took=%.0fms transcript_chars=%d",
+        "model_ready=%s model_loaded=%s took=%.0fms transcript_chars=%d "
+        "finalize=%s vad_start=%s vad_end=%s vad_utterance_ms=%s pre_roll=%s",
         voice_uid,
         device_id,
         device_name,
@@ -776,7 +937,7 @@ def _log_native_stt_diagnostic(
         channels,
         samples,
         len(pcm),
-        chunks,
+        len(pcm) // 960,
         rms,
         peak,
         muted,
@@ -784,6 +945,11 @@ def _log_native_stt_diagnostic(
         model_loaded,
         took_ms,
         len(user_input),
+        meta.get("finalization_reason"),
+        meta.get("vad_speech_start_ts"),
+        meta.get("vad_speech_end_ts"),
+        meta.get("vad_utterance_ms"),
+        meta.get("pre_roll_bytes"),
     )
 
 
@@ -810,6 +976,9 @@ async def native_voice_endpoint(websocket: WebSocket):
     await websocket.accept()
     voice_uid = uuid.uuid4().hex[:8]
     logger.info("[voice:%s] native connection open (peer=%s)", voice_uid, websocket.client)
+    register_window_socket(websocket)
+    with contextlib.suppress(Exception):
+        await websocket.send_json({"type": "server", "build": BUILD_FINGERPRINT})
     session_id = await memory_manager.create_session()
     loop = asyncio.get_running_loop()
     session = None
@@ -835,13 +1004,14 @@ async def native_voice_endpoint(websocket: WebSocket):
         loop.call_soon_threadsafe(lambda: asyncio.create_task(_process_utterance(pcm)))
 
     async def _process_utterance(pcm: bytes) -> None:
-        user_input = await _native_transcribe(session, pcm, websocket, voice_uid)
+        voice_cycle_id = uuid.uuid4().hex[:12]
+        user_input = await _native_transcribe(session, pcm, websocket, voice_uid, voice_cycle_id)
         if not user_input:
             _emit_state("IDLE", "no speech detected")
             return
         logger.info("[voice:%s] User (native voice) %d chars", voice_uid, len(user_input))
         _emit_state("PROCESSING", "stt complete")
-        await handle_user_input(user_input, session_id, websocket, voice_uid)
+        await _dispatch_user_input(user_input, session_id, websocket, voice_uid, voice_cycle_id)
         _emit_state("IDLE", "utterance complete")
 
     try:
@@ -851,6 +1021,10 @@ async def native_voice_endpoint(websocket: WebSocket):
 
             if msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
+            elif msg_type == "window_action_ack":
+                request_id = data.get("request_id")
+                if request_id:
+                    notify_window_ack(request_id)
             elif msg_type == "connect":
                 if session is None:
                     session = NativeVoiceSession(
@@ -865,7 +1039,13 @@ async def native_voice_endpoint(websocket: WebSocket):
                 if not session.connect():
                     reason = session.diagnostics().get("error") or "failed to open microphone"
                     message = _native_connect_message(reason, session)
-                    await websocket.send_json({"type": "error", "message": message})
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "error_scope": "device_unavailable",
+                            "message": message,
+                        }
+                    )
             elif msg_type == "get_devices":
                 await websocket.send_json({"type": "devices", "devices": list_input_devices()})
             elif msg_type == "set_device":
@@ -891,7 +1071,12 @@ async def native_voice_endpoint(websocket: WebSocket):
                 if not ok:
                     reason = session.diagnostics().get("error") or "failed to start listening"
                     await websocket.send_json(
-                        {"type": "error", "message": _native_connect_message(reason, session)}
+                        {
+                            "type": "error",
+                            "error_scope": "stream",
+                            "voice_cycle_id": uuid.uuid4().hex[:12],
+                            "message": _native_connect_message(reason, session),
+                        }
                     )
             elif msg_type == "stop_listening":
                 if session is not None:
@@ -929,20 +1114,26 @@ async def native_voice_endpoint(websocket: WebSocket):
                         tool_args["confirm"] = True
                         try:
                             result = await tool_registry.execute_tool(tool_name, tool_args)
-                            await websocket.send_json({
-                                "type": "response",
-                                "text": f"Done. {result.data if result.success else result.error}",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "type": "response",
+                                    "text": f"Done. {result.data if result.success else result.error}",
+                                }
+                            )
                         except Exception as exc:
-                            await websocket.send_json({
-                                "type": "response",
-                                "text": f"Action failed: {exc}",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "type": "response",
+                                    "text": f"Action failed: {exc}",
+                                }
+                            )
                     else:
-                        await websocket.send_json({
-                            "type": "response",
-                            "text": "Action cancelled.",
-                        })
+                        await websocket.send_json(
+                            {
+                                "type": "response",
+                                "text": "Action cancelled.",
+                            }
+                        )
                     pending_tool_confirmations.pop(session_id, None)
                 else:
                     await handle_ws_confirm(session_id, tool_name, confirm, websocket, voice_uid)
@@ -958,6 +1149,7 @@ async def native_voice_endpoint(websocket: WebSocket):
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(e)})
     finally:
+        unregister_window_socket(websocket)
         if session is not None:
             session.disconnect()
 
@@ -971,6 +1163,15 @@ if not os.path.isdir(frontend_dist):
     _alt = os.path.join(_this_dir, "jarvis_frontend", "dist")
     if os.path.isdir(_alt):
         frontend_dist = _alt
+
+# Fingerprint of the served frontend bundle.  The renderer compares this over
+# the WebSocket and reloads when it changes, so the running Electron app can
+# never stay stuck on a stale bundle after a rebuild + backend restart.
+BUILD_FINGERPRINT = "dev"
+if os.path.isdir(frontend_dist):
+    mains = sorted(Path(frontend_dist).glob("assets/main-*.js"))
+    if mains:
+        BUILD_FINGERPRINT = mains[0].stem
 
 if os.path.isdir(frontend_dist):
     app.mount("/static", StaticFiles(directory=frontend_dist), name="static")

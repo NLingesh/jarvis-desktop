@@ -1,0 +1,209 @@
+/* MinimalBubble component styles. Imported by MinimalBubble.tsx so the classes
+   below are available in both the main bundle (header orb + orb mode) and the
+   standalone bubble entry. No global html/body/#root sizing lives here. */
+
+.minimal-bubble {
+  width: 72px;
+  height: 72px;
+  position: relative;
+}
+
+.minimal-bubble-svg {
+  position: absolute;
+  inset: 0;
+  width: 72px;
+  height: 72px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* Live audio-level halo. Invisible unless a state activates it; the only
+   animation is a cheap transform scale driven by real frame levels. */
+.minimal-bubble-halo {
+  fill: none;
+  stroke: rgba(0, 238, 255, 0.35);
+  stroke-width: 2;
+  opacity: 0;
+  transform-origin: 36px 36px;
+  transition: opacity 200ms ease;
+}
+
+.minimal-bubble-circle {
+  fill: rgba(3, 8, 18, 0.1);
+  stroke: rgba(255, 255, 255, 0.94);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  transform-origin: 36px 36px;
+  /* One static drop-shadow only; the idle glow pulse is a cheap opacity
+     animation, never an animated filter (filters force repeated repaints). */
+  filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.18));
+  transition:
+    stroke 180ms ease,
+    transform 140ms ease-out;
+}
+
+/* Clickable inner target. Smaller than the window so a native drag region (the
+   surrounding ring + transparent corners) always exists around it. */
+.minimal-bubble-button {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 56px;
+  height: 56px;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #ffffff;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  -webkit-app-region: no-drag;
+}
+
+.minimal-bubble-text {
+  color: #ffffff;
+  font:
+    600 9px/1 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    'Liberation Mono',
+    monospace;
+  letter-spacing: 0;
+  text-shadow: 0 0 8px rgba(255, 255, 255, 0.42);
+}
+
+/* Idle glow: subtle static shadow + slow opacity pulse (compositor-cheap). */
+.minimal-bubble-idle .minimal-bubble-circle {
+  animation: minimalIdlePulse 3.2s ease-in-out infinite;
+}
+
+.minimal-bubble-listening .minimal-bubble-circle,
+.minimal-bubble-speaking .minimal-bubble-circle {
+  stroke: rgba(0, 238, 255, 1);
+}
+
+.minimal-bubble-listening .minimal-bubble-circle {
+  animation: minimalPulse 1.05s ease-in-out infinite;
+}
+
+/* Listening responds to real mic frames: the halo scales with the level. */
+.minimal-bubble-listening .minimal-bubble-halo {
+  opacity: 1;
+  transform: scale(calc(1 + var(--bubble-audio-level, 0) * 0.22));
+}
+
+/* Processing: restrained rotating ring. */
+.minimal-bubble-thinking .minimal-bubble-circle,
+.minimal-bubble-processing .minimal-bubble-circle {
+  stroke: rgba(255, 255, 255, 0.96);
+  stroke-dasharray: 40 16;
+  animation: minimalRotate 1.8s linear infinite;
+}
+
+/* Working: controlled forward progress (marching dash), visually distinct
+   from the processing rotation and clearly bounded. */
+.minimal-bubble-working .minimal-bubble-circle {
+  stroke: rgba(141, 252, 255, 0.95);
+  stroke-dasharray: 26 30;
+  animation: minimalProgress 2.6s linear infinite;
+}
+
+.minimal-bubble-working .minimal-bubble-halo {
+  opacity: 0;
+}
+
+.minimal-bubble-speaking .minimal-bubble-circle {
+  stroke: rgba(0, 238, 255, 1);
+  transform: scale(calc(1 + var(--bubble-audio-level, 0) * 0.08));
+  animation: minimalSpeakingPulse 620ms ease-in-out infinite;
+}
+
+.minimal-bubble-error .minimal-bubble-circle {
+  stroke: rgba(255, 93, 93, 0.95);
+  /* One brief flash to draw the eye, then a steady readable warning. */
+  animation: minimalErrorFlash 0.9s ease-out 1;
+}
+
+.minimal-bubble-offline .minimal-bubble-button {
+  opacity: 0.48;
+}
+
+.minimal-bubble-offline .minimal-bubble-circle {
+  stroke: rgba(255, 255, 255, 0.4);
+  filter: none;
+}
+
+@keyframes minimalIdlePulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.82;
+  }
+}
+
+@keyframes minimalPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes minimalRotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes minimalSpeakingPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.76;
+  }
+}
+
+/* Working: dash segment marches forward around the ring (progress feel). */
+@keyframes minimalProgress {
+  to {
+    stroke-dashoffset: -56;
+  }
+}
+
+/* Error: a single short flash, then the steady red stroke remains. */
+@keyframes minimalErrorFlash {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  25%,
+  65% {
+    opacity: 0.35;
+  }
+}
+
+/* While the window is being dragged natively, pause every animation on the
+   bubble so nothing repaints behind the moving transparent surface. */
+.bubble-container.bubble-dragging .minimal-bubble,
+.bubble-container.bubble-dragging .minimal-bubble * {
+  animation-play-state: paused !important;
+  transition-duration: 1ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .minimal-bubble,
+  .minimal-bubble * {
+    animation: none !important;
+    transition-duration: 1ms !important;
+  }
+}

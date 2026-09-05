@@ -26,7 +26,6 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -60,23 +59,30 @@ TOOL_RISK: dict[str, str] = {
     "find_by_extension": RISK_READ_ONLY,
     "identify_file_type": RISK_READ_ONLY,
     "recall_memory": RISK_READ_ONLY,
+    "get_current_context": RISK_READ_ONLY,
     "web_search": RISK_READ_ONLY,
+    "resolve_known_location": RISK_READ_ONLY,
+    "list_running_applications": RISK_READ_ONLY,
     # Reversible side effects (with verification)
     "create_file": RISK_REVERSIBLE,
     "create_folder": RISK_REVERSIBLE,
     "move_file": RISK_REVERSIBLE,
     "copy_file": RISK_REVERSIBLE,
     "launch_app": RISK_REVERSIBLE,
+    "launch_application": RISK_REVERSIBLE,
     "open_terminal": RISK_REVERSIBLE,
     "open_file": RISK_REVERSIBLE,
     "open_folder": RISK_REVERSIBLE,
+    "open_url": RISK_REVERSIBLE,
     "remember_memory": RISK_REVERSIBLE,
+    "update_memory": RISK_REVERSIBLE,
     "forget_memory": RISK_REVERSIBLE,
     # Destructive / sensitive
     "delete_file": RISK_DESTRUCTIVE,
     "close_app": RISK_DESTRUCTIVE,
     "execute_shell": RISK_DESTRUCTIVE,
-    "screenshot": RISK_DESTRUCTIVE,  # captures screen; sensitive
+    "screenshot": RISK_DESTRUCTIVE,  # privacy-sensitive capture requires approval
+    "clear_all_memories": RISK_DESTRUCTIVE,
 }
 
 # Capabilities that always need explicit user approval regardless of risk.
@@ -85,6 +91,7 @@ ALWAYS_CONFIRM: set[str] = {
     "close_app",
     "delete_file",
     "screenshot",
+    "clear_all_memories",
 }
 
 
@@ -98,9 +105,7 @@ def canonicalize_args(args: dict | None) -> str:
     for key, value in (args or {}).items():
         if key in ("confirm", "confirmation_token"):
             continue
-        if isinstance(value, bool):
-            clean[key] = value
-        elif isinstance(value, (int, float)):
+        if isinstance(value, bool) or isinstance(value, (int, float)):
             clean[key] = value
         else:
             clean[key] = str(value)

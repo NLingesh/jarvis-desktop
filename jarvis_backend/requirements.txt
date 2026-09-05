@@ -29,4 +29,5 @@ numpy==1.26.4
 # Dev / testing
 pytest==7.4.3
 pytest-asyncio==1.4.0
+ruff>=0.8.0
 alembic==1.13.2

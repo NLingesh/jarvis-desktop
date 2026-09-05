@@ -1,9 +1,9 @@
 import logging
 import os
-import platform
-import subprocess
 from pathlib import Path
 
+from modules.desktop_open import desktop_open, failure_diagnostics
+from modules.known_locations import resolve_known_location
 from modules.path_policy import (
     is_sensitive_path,
     redact_content,
@@ -14,14 +14,47 @@ from tools import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 
-def _open_with_desktop_handler(path: str) -> None:
-    """Open a path with the user's desktop handler without a shell."""
-    if platform.system() == "Linux":
-        subprocess.Popen(["xdg-open", path])
-    elif platform.system() == "Darwin":
-        subprocess.Popen(["open", path])
-    else:
-        os.startfile(path)  # noqa: S606  (Windows-only, no shell)
+def _safe_canonical(raw: str) -> Path:
+    """Canonicalize a path for reporting even when it does not exist."""
+    try:
+        return Path(raw or "").expanduser().resolve()
+    except OSError:
+        return Path(raw or "").absolute()
+
+
+def _resolve_target(raw: str, expect: str) -> Path:
+    """Resolve a path argument, falling back to known-location names.
+
+    ``expect`` is ``"file"`` or ``"folder"``.  Raises ``PermissionError`` when
+    the resolved path escapes the approved roots and ``FileNotFoundError`` when
+    the target does not exist.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        raise FileNotFoundError("Empty path")
+    known = None
+    if not raw.startswith("/") and not raw.startswith("~"):
+        known = resolve_known_location(raw)
+    try:
+        resolved = resolve_within_roots(known and str(known) or raw)
+    except PermissionError:
+        # The model may invent a plausible-looking absolute path (e.g.
+        # "/home/user/Downloads"). Before refusing, try resolving the basename
+        # against known locations so "Downloads" still opens the real folder.
+        base = Path(raw).name
+        if base and base != raw:
+            known2 = resolve_known_location(base)
+            if known2 is not None:
+                resolved = known2
+            else:
+                raise
+        else:
+            raise
+    exists = resolved.is_file() if expect == "file" else resolved.is_dir()
+    if not exists:
+        label = "File" if expect == "file" else "Directory"
+        raise FileNotFoundError(f"{label} not found: {raw}")
+    return resolved
 
 
 class FileSearchTool(BaseTool):
@@ -33,7 +66,11 @@ class FileSearchTool(BaseTool):
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Filename or pattern"},
-            "directory": {"type": "string", "description": "Directory to search", "default": str(Path.home())},
+            "directory": {
+                "type": "string",
+                "description": "Directory to search",
+                "default": str(Path.home()),
+            },
         },
         "required": ["query"],
     }
@@ -72,26 +109,69 @@ class OpenFileTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Absolute file path"},
+            "path": {
+                "type": "string",
+                "description": "Absolute file path or a friendly name like 'Downloads'",
+            },
         },
         "required": ["path"],
     }
 
     async def execute(self, arguments: dict, context: dict | None = None) -> ToolResult:
-        path = arguments.get("path", "")
+        path = arguments.get("path") or arguments.get("name") or ""
         try:
-            resolved = resolve_within_roots(path)
+            resolved = _resolve_target(path, expect="file")
         except PermissionError as exc:
             return ToolResult(False, error=str(exc))
-        if not resolved.is_file():
-            return ToolResult(False, error=f"File not found: {path}")
+        except FileNotFoundError as exc:
+            return ToolResult(
+                False,
+                error=str(exc),
+                data={
+                    "target_type": "file",
+                    "canonical_path": str(_safe_canonical(path)),
+                    "exists": False,
+                    "complete": True,
+                },
+            )
         if is_sensitive_path(resolved):
-            return ToolResult(False, error=f"Refusing to open a sensitive file: {path}")
+            return ToolResult(
+                False,
+                error=f"Refusing to open a sensitive file: {path}",
+                data={
+                    "target_type": "file",
+                    "canonical_path": str(resolved),
+                    "exists": True,
+                    "complete": True,
+                },
+            )
         try:
-            _open_with_desktop_handler(str(resolved))
-            return ToolResult(True, data={"opened": str(resolved)})
+            desktop_open(str(resolved))
+            return ToolResult(
+                True,
+                data={
+                    "opened": str(resolved),
+                    "resolved": str(resolved),
+                    "target_type": "file",
+                    "canonical_path": str(resolved),
+                    "exists": True,
+                    "complete": True,
+                },
+            )
         except Exception as exc:
-            return ToolResult(False, error=str(exc))
+            return ToolResult(
+                False,
+                error=str(exc),
+                data={
+                    "target_type": "file",
+                    "canonical_path": str(resolved),
+                    "exists": True,
+                    "complete": True,
+                    "diagnostics": failure_diagnostics(
+                        "file", str(resolved), exc, permission_result="approved"
+                    ),
+                },
+            )
 
 
 class OpenFolderTool(BaseTool):
@@ -102,24 +182,37 @@ class OpenFolderTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Absolute folder path"},
+            "path": {
+                "type": "string",
+                "description": "Absolute folder path or a friendly name like 'Downloads'",
+            },
         },
         "required": ["path"],
     }
 
     async def execute(self, arguments: dict, context: dict | None = None) -> ToolResult:
-        path = arguments.get("path", "")
+        path = arguments.get("path") or arguments.get("name") or ""
         try:
-            resolved = resolve_within_roots(path)
+            resolved = _resolve_target(path, expect="folder")
         except PermissionError as exc:
             return ToolResult(False, error=str(exc))
-        if not resolved.is_dir():
-            return ToolResult(False, error=f"Directory not found: {path}")
-        try:
-            _open_with_desktop_handler(str(resolved))
-            return ToolResult(True, data={"opened": str(resolved)})
-        except Exception as exc:
+        except FileNotFoundError as exc:
             return ToolResult(False, error=str(exc))
+        try:
+            desktop_open(str(resolved))
+            return ToolResult(True, data={"opened": str(resolved), "resolved": str(resolved)})
+        except Exception as exc:
+            return ToolResult(
+                False,
+                error=str(exc),
+                data={
+                    "opened": str(resolved),
+                    "resolved": str(resolved),
+                    "diagnostics": failure_diagnostics(
+                        "folder", str(resolved), exc, permission_result="approved"
+                    ),
+                },
+            )
 
 
 class ListDirectoryTool(BaseTool):
@@ -190,7 +283,11 @@ class ReadFileTool(BaseTool):
             content = redact_content(content)
             return ToolResult(
                 True,
-                data={"path": str(resolved), "content": content, "truncated": len(content) >= max_bytes},
+                data={
+                    "path": str(resolved),
+                    "content": content,
+                    "truncated": len(content) >= max_bytes,
+                },
             )
         except Exception as exc:
             return ToolResult(False, error=str(exc))
@@ -204,7 +301,11 @@ class FindRecentFilesTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "directory": {"type": "string", "description": "Directory to search", "default": str(Path.home())},
+            "directory": {
+                "type": "string",
+                "description": "Directory to search",
+                "default": str(Path.home()),
+            },
             "hours": {"type": "integer", "description": "Look back this many hours", "default": 24},
             "limit": {"type": "integer", "description": "Max results", "default": 20},
         },
@@ -249,8 +350,15 @@ class FindByExtensionTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "extension": {"type": "string", "description": "Extension without dot, e.g. py, pdf, jpg"},
-            "directory": {"type": "string", "description": "Directory to search", "default": str(Path.home())},
+            "extension": {
+                "type": "string",
+                "description": "Extension without dot, e.g. py, pdf, jpg",
+            },
+            "directory": {
+                "type": "string",
+                "description": "Directory to search",
+                "default": str(Path.home()),
+            },
             "limit": {"type": "integer", "description": "Max results", "default": 30},
         },
         "required": ["extension"],
@@ -355,7 +463,11 @@ class CreateFileTool(BaseTool):
         "properties": {
             "path": {"type": "string", "description": "Absolute file path"},
             "content": {"type": "string", "description": "Optional initial content", "default": ""},
-            "confirm": {"type": "boolean", "description": "Confirm if overwriting", "default": False},
+            "confirm": {
+                "type": "boolean",
+                "description": "Confirm if overwriting",
+                "default": False,
+            },
         },
         "required": ["path"],
     }
@@ -395,7 +507,11 @@ class DeleteFileTool(BaseTool):
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Absolute path"},
-            "confirm": {"type": "boolean", "description": "Must be true to execute", "default": False},
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true to execute",
+                "default": False,
+            },
         },
         "required": ["path"],
     }
@@ -438,7 +554,11 @@ class MoveFileTool(BaseTool):
         "properties": {
             "source": {"type": "string", "description": "Source path"},
             "destination": {"type": "string", "description": "Destination path"},
-            "confirm": {"type": "boolean", "description": "Confirm if overwriting", "default": False},
+            "confirm": {
+                "type": "boolean",
+                "description": "Confirm if overwriting",
+                "default": False,
+            },
         },
         "required": ["source", "destination"],
     }
@@ -481,7 +601,11 @@ class CopyFileTool(BaseTool):
         "properties": {
             "source": {"type": "string", "description": "Source path"},
             "destination": {"type": "string", "description": "Destination path"},
-            "confirm": {"type": "boolean", "description": "Confirm if overwriting", "default": False},
+            "confirm": {
+                "type": "boolean",
+                "description": "Confirm if overwriting",
+                "default": False,
+            },
         },
         "required": ["source", "destination"],
     }

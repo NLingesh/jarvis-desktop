@@ -109,23 +109,29 @@ async def test_proactive_no_findings_returns_none():
 
 
 # --- remember / forget / profile ---------------------------------------------
+#
+# Memory writes are owned exclusively by the typed tool pipeline
+# (remember_memory / clear_all_memories with secret filtering, dedup,
+# retention, and single-use approval).  The legacy context builder must not
+# persist anything directly.
 
 
-async def test_remember_appends_to_profile_note(fake_vault):
-    ctx = await state.process_command("remember that I like dark mode")
-    assert ctx["profile"]["action"] == "remembered"
-    assert "dark mode" in fake_vault.notes["People/Me.md"]
+async def test_process_command_does_not_write_memory(fake_vault):
+    await state.process_command("remember that I like dark mode")
+    # No direct write: the orchestrator's remember flow owns persistence.
+    assert "dark mode" not in fake_vault.notes.get("People/Me.md", "")
 
 
 async def test_what_do_you_know_about_me_reads_profile(fake_vault):
-    await state.process_command("remember that my name is Wiz")
+    fake_vault.notes["People/Me.md"] = "## About\n- my name is Wiz"
     ctx = await state.process_command("what do you know about me")
     assert ctx["profile"]["action"] == "read"
     assert "Wiz" in ctx["profile"]["content"]
 
 
-async def test_forget_resets_profile(fake_vault):
-    await state.process_command("remember that I like dark mode")
-    ctx = await state.process_command("forget my profile")
-    assert ctx["profile"]["action"] == "forgotten"
-    assert "dark mode" not in fake_vault.notes["People/Me.md"]
+async def test_profile_reset_requires_confirmation_not_direct_write(fake_vault):
+    fake_vault.notes["People/Me.md"] = "## About\n- my name is Wiz"
+    await state.process_command("forget my profile")
+    # Destructive clears are gated behind clear_all_memories approval; the
+    # legacy context builder must never wipe on a bare phrase.
+    assert "my name is Wiz" in fake_vault.notes["People/Me.md"]

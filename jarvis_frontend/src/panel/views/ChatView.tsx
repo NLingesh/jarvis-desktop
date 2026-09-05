@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import './ChatView.css';
 import { searchMemory } from '../../api/memory';
+import { withTimeout } from '../../voiceDiagnostics';
 
 export interface Message {
   id: string;
@@ -74,74 +75,88 @@ const ChatView: React.FC = () => {
     setMemoryChips((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if (!text || isLoading) return;
-    setInput('');
-    setMemoryChips([]);
-    const userMsg: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: text,
-      timestamp: Date.now(),
-    };
-    const assistantId = `assistant-${Date.now()}`;
-    const assistantMsg: Message = {
-      id: assistantId,
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      isStreaming: true,
-    };
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
-    setStreamingId(assistantId);
-    setIsLoading(true);
+  const handleSend = useCallback(
+    async (providedText?: string) => {
+      const text = (providedText ?? input).trim();
+      if (!text || isLoading) return;
+      setInput('');
+      setMemoryChips([]);
+      const userMsg: Message = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: text,
+        timestamp: Date.now(),
+      };
+      const assistantId = `assistant-${Date.now()}`;
+      const assistantMsg: Message = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        isStreaming: true,
+      };
+      setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      setStreamingId(assistantId);
+      setIsLoading(true);
 
-    try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text }),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
-
-      const decoder = new TextDecoder();
-      let accumulated = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        accumulated += chunk;
+      try {
+        // Route typed chat through the orchestrator-backed /api/chat endpoint so
+        // desktop commands dispatch real tools (open_folder, etc.) instead of the
+        // bare-LLM /api/llm/generate path that only produced generic refusals.
+        const api = (window as any).electronAPI;
+        const token = api?.getSessionToken
+          ? ((await api.getSessionToken()) as string | null)
+          : null;
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) headers['X-Jarvis-Token'] = token;
+        const session_id = localStorage.getItem('jarvis_chat_session') || undefined;
+        // Bound the request so the panel can never hang in a streaming state
+        // forever if the backend (or its LLM) stalls.
+        const response = await withTimeout(
+          fetch('/api/chat', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ message: text, session_id }),
+          }),
+          60000,
+          'JARVIS took too long to respond. Please try again.',
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = (await response.json()) as {
+          text?: string;
+          session_id?: string;
+          tool_results?: Array<{ tool?: string; result?: { success?: boolean } }>;
+        };
+        if (payload.session_id) localStorage.setItem('jarvis_chat_session', payload.session_id);
+        const accumulated = payload.text || 'I did not receive a response.';
+        const verified = (payload.tool_results || []).filter((t) => t.result?.success);
+        const display = verified.length
+          ? `${accumulated}\n\n${verified.map((t) => `✓ ${t.tool || 'action'} completed`).join('\n')}`
+          : accumulated;
         setMessages((prev) =>
           prev.map((m) =>
-            m.id === assistantId ? { ...m, content: accumulated, isStreaming: true } : m,
+            m.id === assistantId ? { ...m, content: display, isStreaming: false } : m,
           ),
         );
+      } catch {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: 'Sorry, I encountered an error. Please try again.',
+                  isStreaming: false,
+                }
+              : m,
+          ),
+        );
+      } finally {
+        setIsLoading(false);
+        setStreamingId(null);
       }
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, content: accumulated, isStreaming: false } : m,
-        ),
-      );
-    } catch {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId
-            ? {
-                ...m,
-                content: 'Sorry, I encountered an error. Please try again.',
-                isStreaming: false,
-              }
-            : m,
-        ),
-      );
-    } finally {
-      setIsLoading(false);
-      setStreamingId(null);
-    }
-  }, [input, isLoading]);
+    },
+    [input, isLoading],
+  );
 
   const handleRegenerate = useCallback(
     async (messageId: string) => {
@@ -221,7 +236,7 @@ const ChatView: React.FC = () => {
                 className="chat-suggestion"
                 onClick={() => {
                   setInput(prompt);
-                  handleSend();
+                  void handleSend(prompt);
                 }}
               >
                 {prompt}

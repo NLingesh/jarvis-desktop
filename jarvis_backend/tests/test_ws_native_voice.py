@@ -152,12 +152,14 @@ def test_native_ws_rejects_missing_token(client):
 
 def test_native_ws_ping_pong(client):
     with client.websocket_connect("/ws/voice/native?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "ping"})
         assert ws.receive_json() == {"type": "pong"}
 
 
 def test_native_ws_connect_returns_devices_and_ready(client):
     with client.websocket_connect("/ws/voice/native?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "connect"})
         first = ws.receive_json()
         assert first["type"] == "devices"
@@ -172,6 +174,7 @@ def test_native_ws_connect_returns_devices_and_ready(client):
 
 def test_native_ws_start_stop_listening_flow(client):
     with client.websocket_connect("/ws/voice/native?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "connect"})
         ws.receive_json()  # devices
         ws.receive_json()  # CONNECTING
@@ -191,10 +194,18 @@ def test_native_ws_start_stop_listening_flow(client):
 
 def test_native_ws_get_devices_message(client):
     with client.websocket_connect("/ws/voice/native?token=test-secret-token") as ws:
+        _drain_server(ws)
         ws.send_json({"type": "get_devices"})
         msg = ws.receive_json()
         assert msg["type"] == "devices"
         assert len(msg["devices"]) == 2
+
+
+def _drain_server(ws):
+    """The server sends a ``server`` build-welcome message on connect; consume it."""
+    msg = ws.receive_json()
+    assert msg.get("type") == "server"
+    assert msg.get("build")
 
 
 def _receive_until(ws, msg_type, timeout=5.0):
@@ -252,9 +263,18 @@ def test_native_connect_message_mapping(client):
     import main as main_mod
 
     session = SimpleNamespace(mic=SimpleNamespace(device_info=lambda: {"id": 0}))
-    assert main_mod._native_connect_message("no input device available", session) == "No microphone detected."
-    assert main_mod._native_connect_message("sounddevice not available", session) == "No microphone detected."
-    assert main_mod._native_connect_message("Invalid sample rate for device", session) == "No microphone detected."
+    assert (
+        main_mod._native_connect_message("no input device available", session)
+        == "No microphone detected."
+    )
+    assert (
+        main_mod._native_connect_message("sounddevice not available", session)
+        == "No microphone detected."
+    )
+    assert (
+        main_mod._native_connect_message("Invalid sample rate for device", session)
+        == "No microphone detected."
+    )
     assert "Could not open" in main_mod._native_connect_message("some odd failure", session)
 
 
@@ -277,12 +297,13 @@ def test_native_transcribe_silence_reports_no_signal(client, monkeypatch):
     result = asyncio.run(main_mod._native_transcribe(session, b"\x00\x00" * 16000, FakeWS(), "t"))
     assert result == ""
     assert sent and sent[0]["type"] == "error"
+    assert sent[0]["error_scope"] == "stream"
     assert sent[0]["message"] == "No usable microphone signal detected."
 
 
-def test_native_transcribe_speech_no_text_reports_no_speech(client, monkeypatch):
-    """Audible audio with STT returning '' must report 'Audio received, but no
-    speech was recognized.'."""
+def test_native_transcribe_speech_no_text_is_no_speech_status(client, monkeypatch):
+    """Audible audio with STT returning '' must be a non-blocking no-speech
+    voice_status, never a hard error card."""
     import array
 
     import numpy as np
@@ -302,10 +323,31 @@ def test_native_transcribe_speech_no_text_reports_no_speech(client, monkeypatch)
     tone = (np.sin(2 * np.pi * 440 * np.arange(16000) / 16000) * 0.5 * 32767).astype(np.int16)
     pcm = array.array("h", tone).tobytes()
     session = SimpleNamespace(mic=FakeMic())
-    result = asyncio.run(main_mod._native_transcribe(session, pcm, FakeWS(), "t"))
+    result = asyncio.run(
+        main_mod._native_transcribe(session, pcm, FakeWS(), "t", voice_cycle_id="cyc123")
+    )
     assert result == ""
-    assert sent and sent[0]["type"] == "error"
-    assert sent[0]["message"] == "Audio received, but no speech was recognized."
+    assert sent and sent[0]["type"] == "voice_status"
+    assert sent[0]["status"] == "no_speech"
+    assert sent[0]["voice_cycle_id"] == "cyc123"
+    assert not any(p.get("type") == "error" for p in sent)
+
+
+def test_native_transcribe_no_pcm_is_no_speech_status(client, monkeypatch):
+    """Empty captured audio must be a subtle no-speech status, not an error."""
+    import main as main_mod
+
+    sent = []
+
+    class FakeWS:
+        async def send_json(self, payload):
+            sent.append(payload)
+
+    session = SimpleNamespace(mic=None)
+    result = asyncio.run(main_mod._native_transcribe(session, b"", FakeWS(), "t", "cyc9"))
+    assert result == ""
+    assert sent and sent[0]["type"] == "voice_status"
+    assert sent[0]["status"] == "no_speech"
 
 
 def test_native_transcribe_muted_reports_muted(client, monkeypatch):
@@ -333,4 +375,6 @@ def test_native_transcribe_muted_reports_muted(client, monkeypatch):
     session = SimpleNamespace(mic=FakeMic())
     result = asyncio.run(main_mod._native_transcribe(session, pcm, FakeWS(), "t"))
     assert result == ""
-    assert sent and sent[0]["message"] == "Microphone is muted."
+    assert sent and sent[0]["type"] == "error"
+    assert sent[0]["error_scope"] == "stream"
+    assert sent[0]["message"] == "Microphone is muted."

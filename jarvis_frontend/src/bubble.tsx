@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import VoiceOrb from './components/VoiceOrb';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { computeRms, uint8ToBase64 } from './audioStream';
 import { describeMicError, logVoice } from './voiceDiagnostics';
 import { useAutonomousBehaviors } from './orb/useAutonomousBehaviors';
+import MinimalBubble from './components/MinimalBubble';
 import type { OrbState } from './orb/OrbEngine';
 import './bubble.css';
 const DEFAULT_WAKE_WORD = 'computer';
@@ -11,11 +11,9 @@ const WAKE_PING_INTERVAL_MS = 25000;
 const ENDPOINT_RMS_THRESHOLD = 500;
 const ENDPOINT_SILENCE_MS = 900;
 const CAPTURE_TIMEOUT_MS = 15000;
-const REPLY_GRACE_TIMEOUT_MS = 60000;
 
 function BubbleApp() {
   const [orbState, setOrbState] = useState<OrbState>('idle');
-  const [pttActive, setPttActive] = useState(false);
   const [isPanelOpen, _setIsPanelOpen] = useState(false);
   const [, setWakePulse] = useState(false);
   const [replyText, setReplyText] = useState('');
@@ -29,18 +27,12 @@ function BubbleApp() {
   const wakeStartingRef = useRef(false);
   const isListeningRef = useRef(false);
   const lastWakeTriggerRef = useRef(0);
-  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
-  const pttWsRef = useRef<WebSocket | null>(null);
-  const pttStreamRef = useRef<MediaStream | null>(null);
-  const pttCtxRef = useRef<AudioContext | null>(null);
-  const pttWorkletRef = useRef<AudioWorkletNode | null>(null);
-  const pttSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const pttFlushResolveRef = useRef<(() => void) | null>(null);
-  const pttRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const pttReplyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingAudioRef = useRef(false);
   const audioChunksRef = useRef<string[]>([]);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const playbackTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const pendingSegmentsRef = useRef(0);
   const captureFlushResolveRef = useRef<(() => void) | null>(null);
   const captureTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -101,8 +93,10 @@ function BubbleApp() {
   }, []);
 
   // ---------------------------------------------------------------------------
-  // TTS playback queue
-  // ---------------------------------------------------------------------------
+  // TTS playback queue. HTMLMediaElement (`new Audio`) cannot load any audio
+  // resource in this Electron window (MEDIA_ERR_SRC_NOT_SUPPORTED) while the
+  // Web Audio stack decodes and plays WAV/MP3 reliably, so playback routes
+  // through AudioContext. The single queue/guard is unchanged.
   const playNextAudio = useCallback(() => {
     if (isPlayingAudioRef.current) return;
     const next = audioQueueRef.current.shift();
@@ -110,36 +104,94 @@ function BubbleApp() {
       setOrbState('idle');
       return;
     }
-    isPlayingAudioRef.current = true;
-    setOrbState('speaking');
-    try {
-      const audioData = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
-      const isWav =
-        audioData.byteLength > 4 &&
-        String.fromCharCode(audioData[0], audioData[1], audioData[2], audioData[3]) === 'RIFF';
-      const blob = new Blob([audioData], { type: isWav ? 'audio/wav' : 'audio/mpeg' });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
-        playNextAudio();
-      };
-      audio.onerror = () => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
-        playNextAudio();
-      };
-      audio.play().catch(() => {
-        URL.revokeObjectURL(url);
-        isPlayingAudioRef.current = false;
-        playNextAudio();
-      });
-    } catch {
-      isPlayingAudioRef.current = false;
-      playNextAudio();
+    let ctx = playbackContextRef.current;
+    if (!ctx) {
+      ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      playbackContextRef.current = ctx;
     }
-  }, []);
+    (async () => {
+      try {
+        if (ctx.state === 'suspended') {
+          try {
+            await ctx.resume();
+          } catch {
+            /* no output device */
+          }
+        }
+        if (ctx.state !== 'running') {
+          setOrbState('idle');
+          logVoice('error', {
+            level: 'error',
+            stage: 'audio_context',
+            code: 'no_audio_output',
+            message: 'No audio output device available',
+          });
+          return;
+        }
+        const bytes = Uint8Array.from(atob(next), (c) => c.charCodeAt(0));
+        const buffer = await ctx.decodeAudioData(bytes.buffer);
+        if (!buffer || buffer.length === 0 || buffer.duration <= 0) {
+          throw new Error('empty audio buffer');
+        }
+        isPlayingAudioRef.current = true;
+        setOrbState('speaking');
+        logVoice('speaking', {
+          level: 'debug',
+          bytes: bytes.byteLength,
+          duration_s: Math.round(buffer.duration * 1000) / 1000,
+          sample_rate: buffer.sampleRate,
+          channels: buffer.numberOfChannels,
+        });
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = 1.0;
+        const gain = ctx.createGain();
+        gain.gain.value = 0.8;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        playbackSourceRef.current = source;
+        const startedAt = Date.now();
+        source.onended = () => {
+          if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+          if (playbackSourceRef.current === source) playbackSourceRef.current = null;
+          if (isPlayingAudioRef.current) {
+            logVoice('speaking_end', {
+              level: 'debug',
+              played_ms: Date.now() - startedAt,
+            });
+          }
+          isPlayingAudioRef.current = false;
+          playNextAudio();
+        };
+        playbackTimerRef.current = setTimeout(
+          () => {
+            if (isPlayingAudioRef.current && playbackSourceRef.current === source) {
+              logVoice('error', {
+                level: 'warn',
+                stage: 'audio_context',
+                code: 'playback_end_timeout',
+                message: 'playback end event never fired; releasing queue',
+              });
+              try {
+                source.stop();
+              } catch {
+                /* already stopped */
+              }
+              playbackSourceRef.current = null;
+              isPlayingAudioRef.current = false;
+              playNextAudio();
+            }
+          },
+          buffer.duration * 1000 + 1500,
+        );
+        source.start();
+      } catch {
+        isPlayingAudioRef.current = false;
+        if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+        playNextAudio();
+      }
+    })();
+  }, [logVoice]);
 
   const enqueueAudio = useCallback(
     (audioBase64: string) => {
@@ -237,7 +289,7 @@ function BubbleApp() {
   }, [teardownWakeMic]);
 
   const buildWsUrl = useCallback(async (): Promise<string> => {
-    const api = (window as any).electronAPI;
+    const api = window.electronAPI;
     const token = api?.getSessionToken ? await api.getSessionToken() : null;
     const server = (localStorage.getItem('serverUrl') || '').trim() || 'localhost:8000';
     const trimmed = server.replace(/\/*$/, '');
@@ -287,7 +339,7 @@ function BubbleApp() {
       endpointing: boolean,
     ) => {
       worklet.port.onmessage = (event) => {
-        if (wakeWsRef.current !== ws && pttWsRef.current !== ws) return;
+        if (wakeWsRef.current !== ws) return;
         if (!event.data || event.data.type !== 'pcm') return;
         const bytes = event.data.pcm as ArrayBuffer;
         if (bytes && bytes.byteLength > 0) {
@@ -322,7 +374,7 @@ function BubbleApp() {
   const attachVoiceHandler = useCallback(
     (ws: WebSocket, onReplyDone?: (socket: WebSocket) => void) => {
       ws.onmessage = (event) => {
-        if (wakeWsRef.current !== ws && pttWsRef.current !== ws) return;
+        if (wakeWsRef.current !== ws) return;
         let data: any;
         try {
           data = JSON.parse(event.data);
@@ -332,7 +384,6 @@ function BubbleApp() {
         switch (data.type) {
           case 'status':
             if (data.status === 'processing') setOrbState('thinking');
-            else if (data.status === 'generating_speech') setOrbState('speaking');
             break;
           case 'transcript':
             setReplyText(data.text);
@@ -349,7 +400,6 @@ function BubbleApp() {
             break;
           case 'audio_queue':
             pendingSegmentsRef.current = data.count ?? 0;
-            setOrbState('speaking');
             break;
           case 'audio_segment_start':
             audioChunksRef.current = [];
@@ -473,7 +523,7 @@ function BubbleApp() {
       setTimeout(() => setWakePulse(false), 800);
       if (navigator.vibrate) navigator.vibrate(50);
       playConfirmationChime();
-      const api = (window as any).electronAPI;
+      const api = window.electronAPI;
       if (api?.notifyWakeWordDetected) {
         try {
           await api.notifyWakeWordDetected();
@@ -488,164 +538,8 @@ function BubbleApp() {
   }, [playConfirmationChime]);
 
   // ---------------------------------------------------------------------------
-  // PTT capture (bubble "Talk" button).
+  // Hands-free command capture (after wake word) on the wake WebSocket.
   // ---------------------------------------------------------------------------
-  const closePttWs = useCallback((ws: WebSocket) => {
-    if (pttWsRef.current === ws) {
-      try {
-        ws.close();
-      } catch {
-        /* ignore */
-      }
-      pttWsRef.current = null;
-    }
-  }, []);
-
-  const beginPttStream = useCallback(async () => {
-    if (pttWsRef.current) return;
-    try {
-      const ws = new WebSocket(await buildWsUrl());
-      pttWsRef.current = ws;
-
-      ws.onopen = () => {
-        if (pttWsRef.current !== ws) {
-          ws.close();
-          return;
-        }
-        ws.send(
-          JSON.stringify({ type: 'audio_start', format: 'pcm16', sample_rate: 16000, channels: 1 }),
-        );
-      };
-
-      ws.onerror = () => {
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-      };
-
-      attachVoiceHandler(ws, () => closePttWs(ws));
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      pttStreamRef.current = stream;
-
-      let ctx = pttCtxRef.current;
-      if (!ctx || ctx.state === 'closed') {
-        ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        pttCtxRef.current = ctx;
-      }
-      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-      await ctx.audioWorklet.addModule('/pcmWorklet.js');
-      const source = ctx.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(ctx, 'pcm16-capture', {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        processorOptions: { sampleRate: ctx.sampleRate },
-      });
-      const zeroGain = ctx.createGain();
-      zeroGain.gain.value = 0;
-      source.connect(worklet);
-      worklet.connect(zeroGain);
-      zeroGain.connect(ctx.destination);
-
-      setWorkletHandler(worklet, ws, 'audio_chunk', false);
-
-      pttSourceRef.current = source;
-      pttWorkletRef.current = worklet;
-      pttRecordingTimerRef.current = setTimeout(() => {
-        if (pttWorkletRef.current) void stopPttStream();
-      }, 30000);
-    } catch (err) {
-      console.warn('PTT stream failed', err);
-      void stopPttStream();
-    }
-  }, [attachVoiceHandler, buildWsUrl, closePttWs, setWorkletHandler]);
-
-  const stopPttStream = useCallback(async () => {
-    const ws = pttWsRef.current;
-    const stream = pttStreamRef.current;
-    const worklet = pttWorkletRef.current;
-
-    if (pttRecordingTimerRef.current) {
-      clearTimeout(pttRecordingTimerRef.current);
-      pttRecordingTimerRef.current = undefined;
-    }
-
-    if (!worklet && !stream) {
-      if (pttReplyTimerRef.current) {
-        clearTimeout(pttReplyTimerRef.current);
-        pttReplyTimerRef.current = undefined;
-      }
-      setOrbState('idle');
-      setPttActive(false);
-      return;
-    }
-
-    try {
-      if (worklet) {
-        await new Promise<void>((resolve) => {
-          pttFlushResolveRef.current = resolve;
-          worklet.port.postMessage({ type: 'flush' });
-          setTimeout(() => {
-            if (pttFlushResolveRef.current) {
-              pttFlushResolveRef.current = null;
-              resolve();
-            }
-          }, 500);
-        });
-      }
-    } catch {
-      /* ignore */
-    }
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: 'audio_end' }));
-      } catch {
-        /* ignore */
-      }
-    }
-
-    if (worklet) {
-      worklet.port.onmessage = null;
-      try {
-        worklet.disconnect();
-      } catch {
-        /* ignore */
-      }
-      pttWorkletRef.current = null;
-    }
-    if (pttSourceRef.current) {
-      try {
-        pttSourceRef.current.disconnect();
-      } catch {
-        /* ignore */
-      }
-      pttSourceRef.current = null;
-    }
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      pttStreamRef.current = null;
-    }
-    if (pttCtxRef.current && pttCtxRef.current.state !== 'closed') {
-      pttCtxRef.current.close().catch(() => {});
-      pttCtxRef.current = null;
-    }
-
-    // Keep the socket open so the reply + TTS can arrive; close it after a
-    // grace period in case the backend never responds.
-    if (ws) {
-      if (pttReplyTimerRef.current) clearTimeout(pttReplyTimerRef.current);
-      pttReplyTimerRef.current = setTimeout(() => closePttWs(ws), REPLY_GRACE_TIMEOUT_MS);
-    }
-
-    setOrbState('thinking');
-    setPttActive(false);
-  }, [closePttWs]);
-
   const beginMicStream = useCallback(
     async (ws: WebSocket) => {
       try {
@@ -777,27 +671,6 @@ function BubbleApp() {
   handleWakeWordDetectedRef.current = handleWakeWordDetected;
   startWakeWordListenerRef.current = startWakeWordListener;
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    dragStartRef.current = { x: e.clientX, y: e.clientY };
-  };
-
-  const handleMouseUp = (e: React.MouseEvent) => {
-    if (!dragStartRef.current) return;
-    const dx = e.clientX - dragStartRef.current.x;
-    const dy = e.clientY - dragStartRef.current.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    dragStartRef.current = null;
-    if (dist < 3) {
-      const api = (window as any).electronAPI;
-      api?.toggleMainWindow?.();
-      recordActivity();
-    }
-  };
-
-  const handleMouseLeave = () => {
-    dragStartRef.current = null;
-  };
-
   useEffect(() => {
     reloadVoiceSettings();
     const handleStorage = (e: StorageEvent) => {
@@ -821,7 +694,7 @@ function BubbleApp() {
   }, [reloadVoiceSettings, ensureMicPermission, stopWakeWordListener]);
 
   useEffect(() => {
-    const api = (window as any).electronAPI;
+    const api = window.electronAPI;
     if (!api?.onMainWindowVisibility) return;
     const unsubscribe = api.onMainWindowVisibility((visible: boolean) => {
       if (visible && !voiceSettingsRef.current.alwaysOnListening) {
@@ -835,30 +708,29 @@ function BubbleApp() {
     };
   }, [stopWakeWordListener]);
 
+  const toggleMainWindow = () => {
+    // Native dragging: the outer `.bubble-container` is a
+    // `-webkit-app-region: drag` region, so the OS moves the window — no JS
+    // drag loop. Clicks reaching the `no-drag` button are always genuine, so
+    // no drag/click suppression is needed here.
+    window.electronAPI?.toggleMainWindow?.();
+    recordActivity();
+  };
+
   return (
     <div
       className={`bubble-container ${autonomousState.expression !== 'calm' ? `data-expression-${autonomousState.expression}` : ''}`}
-      onMouseDown={handleMouseDown}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseLeave}
       role="button"
       tabIndex={0}
       aria-label="JARVIS voice assistant bubble"
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
-          const api = (window as any).electronAPI;
-          api?.toggleMainWindow?.();
+          e.preventDefault();
+          toggleMainWindow();
         }
       }}
     >
-      <VoiceOrb
-        state={orbState}
-        analysers={[]}
-        isError={false}
-        isPanelOpen={isPanelOpen}
-        isVoiceActive={orbState === 'listening' || orbState === 'speaking'}
-        isTyping={false}
-      />
+      <MinimalBubble state={orbState} onToggle={toggleMainWindow} />
       {autonomousState.whisper && (
         <div className="orb-whisper" aria-live="polite">
           {autonomousState.whisper}
@@ -879,43 +751,6 @@ function BubbleApp() {
           {replyText}
         </div>
       )}
-      <button
-        className={`ptt-button ${pttActive ? 'active' : ''}`}
-        onMouseDown={(e) => {
-          e.stopPropagation();
-          setPttActive(true);
-          setOrbState('listening');
-          setReplyText('');
-          stopWakeWordListener();
-          void beginPttStream();
-        }}
-        onMouseUp={(e) => {
-          e.stopPropagation();
-          void stopPttStream();
-        }}
-        onMouseLeave={(e) => {
-          e.stopPropagation();
-          void stopPttStream();
-        }}
-        onTouchStart={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setPttActive(true);
-          setOrbState('listening');
-          setReplyText('');
-          stopWakeWordListener();
-          void beginPttStream();
-        }}
-        onTouchEnd={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          void stopPttStream();
-        }}
-        aria-label="Hold to talk"
-        title="Hold to talk"
-      >
-        {pttActive ? '●' : 'Talk'}
-      </button>
     </div>
   );
 }

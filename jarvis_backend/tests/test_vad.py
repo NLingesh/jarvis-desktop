@@ -91,8 +91,9 @@ def test_vad_reports_speech_start_and_end(fake_silero):
     for _ in range(2):
         vad.feed(loud_pcm)
     assert vad.speaking
-    for _ in range(12):
+    for _ in range(15):
         vad.feed(silent_pcm)
+        time.sleep(0.07)
     assert not vad.speaking
     assert events.count("start") >= 1
     assert events.count("end") >= 1
@@ -154,3 +155,39 @@ def test_vad_reset_clears_utterance(fake_silero):
     vad.reset()
     assert not vad.speaking
     assert vad.diagnostics()["buffered_samples"] == 0
+
+
+def test_vad_pause_between_words_keeps_utterance_open(fake_silero):
+    """A short pause between 'Hey' and 'JARVIS' must not end the utterance."""
+    from managers.vad import VoiceActivityDetector
+
+    events = []
+    vad = VoiceActivityDetector(
+        on_speech_start=lambda: events.append("start"),
+        on_speech_end=lambda: events.append("end"),
+    )
+    vad.start()
+
+    loud = np.random.randn(1600).astype(np.float32) * 0.3
+    silent = np.zeros(1600, dtype=np.float32)
+    loud_pcm = (loud * 32767).astype(np.int16).tobytes()
+    silent_pcm = (silent * 32767).astype(np.int16).tobytes()
+
+    # "Hey" ...
+    vad.feed(loud_pcm)
+    assert vad.speaking
+    # ... a short pause (the fast VAD end fires, but within the endpoint grace) ...
+    vad.feed(silent_pcm)
+    vad.feed(silent_pcm)
+    time.sleep(0.05)
+    assert events.count("end") == 0
+    # ... "JARVIS" resumes: the utterance reopens instead of closing.
+    vad.feed(loud_pcm)
+    assert events.count("end") == 0
+    assert vad.speaking
+
+    # A long trailing silence finally endpoints the single utterance once.
+    for _ in range(16):
+        vad.feed(silent_pcm)
+        time.sleep(0.06)
+    assert events.count("end") == 1

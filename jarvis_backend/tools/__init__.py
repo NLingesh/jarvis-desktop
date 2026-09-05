@@ -9,6 +9,47 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOOL_TIMEOUT = 30.0
 DEFAULT_MAX_OUTPUT = 64 * 1024
 
+# ---------------------------------------------------------------------------
+# Canonical argument normalization.
+#
+# Every tool has ONE canonical JSON schema (see BaseTool.parameters).  Weak
+# models still emit common alternate key names (e.g. {"name": ...} for
+# open_folder).  These compatibility aliases are normalized to the canonical
+# key BEFORE validation, so validation always runs against the canonical shape
+# and unknown keys are rejected with a useful message.  Presentation-only
+# hints (e.g. a `format` key the model adds to list_running_applications) are
+# dropped entirely.
+# ---------------------------------------------------------------------------
+ARG_ALIASES: dict[str, dict[str, str]] = {
+    "open_folder": {"name": "path"},
+    "open_file": {"name": "path"},
+    "launch_application": {"name": "app"},
+    "launch_app": {"name": "app"},
+    "open_url": {"name": "url"},
+    "resolve_known_location": {"location": "name", "path": "name"},
+}
+
+# Keys that are accepted but ignored before validation (presentation hints).
+ARG_IGNORE: dict[str, set[str]] = {
+    "list_running_applications": {"format"},
+}
+
+
+def normalize_arguments(tool_name: str, args: dict | None) -> dict:
+    """Map compatibility alias keys to canonical names and drop ignored keys.
+
+    Unknown keys are left untouched so validation can reject them with a
+    structured error instead of silently reinterpreting them.
+    """
+    out: dict = {}
+    aliases = ARG_ALIASES.get(tool_name, {})
+    ignored = ARG_IGNORE.get(tool_name, set())
+    for key, value in (args or {}).items():
+        if key in ignored:
+            continue
+        out[aliases.get(key, key)] = value
+    return out
+
 
 class ToolError(Exception):
     """Raised for user-input / permission / capability errors in a tool.
@@ -62,7 +103,13 @@ class BaseTool(abc.ABC):
         ...
 
     def validate_arguments(self, arguments: dict) -> str | None:
-        """Validate arguments against the JSON schema.  Returns an error string or None."""
+        """Validate arguments against the JSON schema.  Returns an error string or None.
+
+        Callers must pass arguments that were already normalized via
+        :func:`normalize_arguments`.  Unknown keys produce a structured error
+        that names the offending key and, when a single canonical string
+        property exists, the expected key.
+        """
         args = arguments or {}
         props = self.parameters.get("properties", {})
         required = self.parameters.get("required", [])
@@ -73,14 +120,17 @@ class BaseTool(abc.ABC):
 
         for field, value in args.items():
             if field not in props:
-                return f"Unknown argument: {field}"
+                hint = ""
+                if len(props) == 1:
+                    only = next(iter(props))
+                    hint = f" Did you mean '{only}'?"
+                return f"Unknown argument: '{field}'.{hint}"
             prop = props.get(field, {})
             expected = prop.get("type")
             if expected == "string" and not isinstance(value, str):
                 return f"Argument '{field}' must be a string"
-            if expected == "integer":
-                if isinstance(value, bool) or not isinstance(value, int):
-                    return f"Argument '{field}' must be an integer"
+            if expected == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+                return f"Argument '{field}' must be an integer"
             if expected == "boolean" and not isinstance(value, bool):
                 return f"Argument '{field}' must be a boolean"
             if expected in ("array", "object") and not isinstance(value, (list, dict)):
@@ -144,11 +194,12 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(False, error=f"Unknown tool: {name}")
-        error = tool.validate_arguments(arguments or {})
+        normalized = normalize_arguments(name, arguments or {})
+        error = tool.validate_arguments(normalized)
         if error:
             return ToolResult(False, error=error)
         try:
-            result = await tool.execute(arguments or {}, context=context)
+            result = await tool.execute(normalized, context=context)
             return truncate_output(result, tool.max_output_bytes)
         except ToolError as exc:
             return ToolResult(False, error=exc.message)
